@@ -8,6 +8,7 @@ import java.net.http.HttpResponse
 import java.util.Scanner
 
 fun main() {
+    // Фикс кодировки для корректного отображения кириллицы
     System.setOut(PrintStream(System.out, true, "UTF-8"))
     System.setErr(PrintStream(System.err, true, "UTF-8"))
 
@@ -19,52 +20,109 @@ fun main() {
     val client = HttpClient.newHttpClient()
     val scanner = Scanner(System.`in`, "UTF-8")
 
-    println("Чат с Cloudflare AI (бесплатный)")
-    println("Модель: Llama 3.1 8B")
-    println("Для выхода введите 'exit'")
-    println("─".repeat(40))
+    println("Сравнение ответов LLM: без ограничений и с ограничениями")
+    println("─".repeat(50))
 
     while (true) {
-        print("Вы: ")
+        print("\nВведите ваш вопрос (или 'exit' для выхода): ")
         val userInput = scanner.nextLine()
         if (userInput.equals("exit", ignoreCase = true)) break
 
-        val requestBody = JSONObject().apply {
-            // модель можно менять: @cf/meta/llama-3.1-8b-instruct,
-            // @cf/deepseek-ai/deepseek-r1-distill-qwen-32b и др.
+        // ────────────────────────────────────────────
+        // 1. Запрос БЕЗ ограничений
+        // ────────────────────────────────────────────
+        val requestBodyNoLimit = JSONObject().apply {
             put("model", "@cf/meta/llama-3.1-8b-instruct")
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
                     put("role", "user")
-                    put("content", userInput)
+                    put("content", userInput)   // оригинальный вопрос
                 })
             })
             put("temperature", 0.7)
+            // max_tokens и stop не передаём – модель сама решает длину
         }.toString()
 
-        val url = "https://api.cloudflare.com/client/v4/accounts/$accountId/ai/v1/chat/completions"
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create(url))
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $apiToken")
-            .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-            .build()
+        val responseNoLimit = sendRequest(client, accountId, apiToken, requestBodyNoLimit)
+        val answerNoLimit = extractAnswer(responseNoLimit)
 
-        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
-        if (response.statusCode() != 200) {
-            println("Ошибка: ${response.statusCode()} ${response.body()}")
-            continue
-        }
+        // ────────────────────────────────────────────
+        // 2. Запрос С ограничениями
+        // ────────────────────────────────────────────
+        val constrainedPrompt = userInput +
+                " (Отвечай строго кратко: не более 40 слов, ровно 2 предложения, закончи ответ словом СТОП.)"
 
-        val json = JSONObject(response.body())
-        val answer = json
-            .getJSONArray("choices")
+        val requestBodyWithLimit = JSONObject().apply {
+            put("model", "@cf/meta/llama-3.1-8b-instruct")
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", constrainedPrompt)
+                })
+            })
+            put("temperature", 0.7)
+            put("max_tokens", 60)               // ограничение по токенам
+            put("stop", JSONArray().apply {     // стоп-слова
+                put("СТОП")
+                put("###")
+            })
+        }.toString()
+
+        val responseWithLimit = sendRequest(client, accountId, apiToken, requestBodyWithLimit)
+        val answerWithLimit = extractAnswer(responseWithLimit)
+
+        // ────────────────────────────────────────────
+        // Вывод обоих ответов
+        // ────────────────────────────────────────────
+        println("\n=== ОТВЕТ БЕЗ ОГРАНИЧЕНИЙ ===")
+        println(answerNoLimit)
+
+        println("\n=== ОТВЕТ С ОГРАНИЧЕНИЯМИ ===")
+        println(answerWithLimit)
+
+        // Простое сравнение
+        println("\n--- Сравнение ---")
+        println("Длина без ограничений : ${answerNoLimit.length} символов")
+        println("Длина с ограничениями: ${answerWithLimit.length} символов")
+        println("Содержит ли ответ 'СТОП'? ${if (answerWithLimit.contains("СТОП")) "Да" else "Нет"}")
+        println("Уложился в 2 предложения? (проверьте визуально)")
+
+        println("─".repeat(50))
+    }
+    println("Работа завершена.")
+}
+
+// ─── Вспомогательные функции ─────────────────────────────
+private fun sendRequest(
+    client: HttpClient,
+    accountId: String,
+    apiToken: String,
+    body: String
+): String {
+    val url = "https://api.cloudflare.com/client/v4/accounts/$accountId/ai/v1/chat/completions"
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create(url))
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer $apiToken")
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+
+    val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() != 200) {
+        println("Ошибка API: ${response.statusCode()} ${response.body()}")
+        return """{"choices":[{"message":{"content":"ОШИБКА"}}]}"""
+    }
+    return response.body()
+}
+
+private fun extractAnswer(jsonStr: String): String {
+    return try {
+        val json = JSONObject(jsonStr)
+        json.getJSONArray("choices")
             .getJSONObject(0)
             .getJSONObject("message")
             .getString("content")
-
-        println("Бот: $answer")
-        println("─".repeat(40))
+    } catch (e: Exception) {
+        "Не удалось разобрать ответ: ${e.message}"
     }
-    println("До свидания!")
 }
