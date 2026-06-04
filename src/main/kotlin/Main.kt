@@ -7,6 +7,8 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.Scanner
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
@@ -17,94 +19,52 @@ fun main() {
     val apiToken = System.getenv("CLOUDFLARE_API_TOKEN")
         ?: error("Установите CLOUDFLARE_API_TOKEN")
 
-    // Увеличенный таймаут (60 секунд)
     val client = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(60))
         .build()
-
-    val model = "@cf/meta/llama-3.1-8b-instruct"  // или более быстрая "@cf/meta/llama-2-7b-chat-int8"
+    val model = "@cf/meta/llama-3.1-8b-instruct"
     val scanner = Scanner(System.`in`, "UTF-8")
 
-    println("Решение задач четырьмя способами (Cloudflare AI)")
+    println("Эксперимент с параметром temperature (с таймаутами)")
     println("─".repeat(60))
 
-    while (true) {
-        println("\nВведите задачу (или 'exit' для выхода):")
-        val task = scanner.nextLine().trim()
-        if (task.equals("exit", ignoreCase = true)) break
-        if (task.isEmpty()) {
-            println("Пустая задача, попробуйте снова.")
-            continue
-        }
-
-        println("\nОтправляю запросы...")
-
-        // 1. Прямой запрос
-        println("[1/4] Прямой запрос...")
-        val answer1 = chat(client, accountId, apiToken, model, task)
-
-        // 2. Пошаговое решение
-        println("[2/4] Пошаговое решение...")
-        val prompt2 = "$task\nРешай пошагово, подробно объясняя каждый этап."
-        val answer2 = chat(client, accountId, apiToken, model, prompt2)
-
-        // 3. Авто-промптинг
-        println("[3/4] Генерация промпта...")
-        val promptGen = """
-Ты — эксперт по составлению промптов для LLM. На основе следующей задачи создай оптимальный промпт,
-который приведёт к правильному и полному решению. Выведи только текст самого промпта, без лишних комментариев.
-
-Задача:
-$task
+    val defaultTask = """
+В одной комнате 3 выключателя, в другой 3 лампочки.
+Можно зайти в комнату с лампочками только один раз.
+Как определить, какой выключатель включает каждую лампочку?
 """.trimIndent()
-        val generatedPrompt = chat(client, accountId, apiToken, model, promptGen)
-        println("Получен промпт. Отправляю запрос с ним...")
-        val answer3 = chat(client, accountId, apiToken, model, generatedPrompt)
 
-        // 4. Группа экспертов
-        println("[4/4] Группа экспертов...")
-        val prompt4 = """
-Твоя задача — решить следующую проблему от лица трёх экспертов.
-Дай сначала решение от лица Аналитика (логический разбор), затем от Инженера (практический, пошаговый план),
-а затем от Критика (оценка правильности и замечания). Запиши мнение каждого эксперта, чётко указывая роль.
+    print("Введите задачу (Enter для задачи про выключатели, 'exit' для выхода): ")
+    val input = scanner.nextLine().trim()
+    if (input.equals("exit", ignoreCase = true)) return
+    val task = input.ifEmpty { defaultTask }
 
-Задача:
-$task
-""".trimIndent()
-        val answer4 = chat(client, accountId, apiToken, model, prompt4)
-
-        // Вывод результатов
-        println("\n" + "=".repeat(60))
-        println("=== 1. ПРЯМОЙ ОТВЕТ ===")
-        println(answer1)
-
-        println("\n=== 2. ПОШАГОВОЕ РЕШЕНИЕ ===")
-        println(answer2)
-
-        println("\n=== 3. АВТО-ПРОМПТИНГ ===")
-        println("Сгенерированный промпт:\n$generatedPrompt")
-        println("Решение:\n$answer3")
-
-        println("\n=== 4. ГРУППА ЭКСПЕРТОВ ===")
-        println(answer4)
-
-        println("\n--- Сравнение длин ---")
-        println("Прямой:           ${answer1.length} символов")
-        println("Пошаговый:        ${answer2.length} символов")
-        println("Авто-промптинг:   ${answer3.length} символов")
-        println("Группа экспертов: ${answer4.length} символов")
+    val temperatures = listOf(0.0, 0.7, 1.2)
+    for (temp in temperatures) {
+        println("\n--- Temperature = $temp ---")
+        print("Запрос... ")
+        val startTime = System.currentTimeMillis()
+        val answer = chatWithTimeout(client, accountId, apiToken, model, task, temp, 30) // таймаут 30 секунд
+        val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
+        println("готово (${"%.1f".format(elapsed)} с)")
+        println(answer)
         println("─".repeat(60))
     }
-
-    println("Программа завершена.")
+    println("Эксперимент завершён. Сравните стиль и содержание ответов.")
 }
 
-fun chat(
+/**
+ * Отправляет запрос с заданным таймаутом в секундах.
+ * Если ответ не получен за указанное время, возвращает сообщение о превышении таймаута.
+ */
+fun chatWithTimeout(
     client: HttpClient,
     accountId: String,
     apiToken: String,
     model: String,
-    userMessage: String
+    userMessage: String,
+    temperature: Double,
+    timeoutSeconds: Long
 ): String {
     return try {
         val body = JSONObject().apply {
@@ -115,7 +75,7 @@ fun chat(
                     put("content", userMessage)
                 })
             })
-            put("temperature", 0.7)
+            put("temperature", temperature)
         }.toString()
 
         val url = "https://api.cloudflare.com/client/v4/accounts/$accountId/ai/v1/chat/completions"
@@ -123,11 +83,14 @@ fun chat(
             .uri(URI.create(url))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer $apiToken")
-            .timeout(Duration.ofSeconds(60))   // таймаут для каждого запроса
+            .timeout(Duration.ofSeconds(timeoutSeconds))   // таймаут на HTTP-уровне
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .build()
 
-        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        // Отправляем асинхронно, чтобы можно было ждать с таймаутом
+        val future = client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        val response = future.get(timeoutSeconds, TimeUnit.SECONDS)
+
         if (response.statusCode() != 200) {
             "Ошибка API: ${response.statusCode()} ${response.body()}"
         } else {
@@ -137,6 +100,8 @@ fun chat(
                 .getJSONObject("message")
                 .getString("content")
         }
+    } catch (e: java.util.concurrent.TimeoutException) {
+        "⏱️ Превышен таймаут ($timeoutSeconds с). Модель не успела ответить."
     } catch (e: Exception) {
         "Ошибка при запросе: ${e.message}"
     }
