@@ -22,7 +22,19 @@ class ChatAgent(
     private val client = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(30))
         .build()
+
+    // Полная история (включая system prompt)
     private val history = mutableListOf<Map<String, String>>()
+
+    // Параметры сжатия
+    var compressionEnabled = true
+    var keepLastMessages = 8           // последние 8 сообщений (4 пары) не сжимаем
+    var compressThreshold = 12         // сжимать, когда сообщений (без system) > 12
+
+    // Текущий саммари
+    private var summary: String? = null
+    // Индекс в history, до которого уже сжато (для внутреннего использования)
+    private var lastCompressedIndex = 0
 
     init {
         loadHistory(systemPrompt)
@@ -36,14 +48,12 @@ class ChatAgent(
                 history.clear()
                 for (i in 0 until jsonArray.length()) {
                     val obj = jsonArray.getJSONObject(i)
-                    history.add(
-                        mapOf(
-                            "role" to obj.getString("role"),
-                            "content" to obj.getString("content")
-                        )
-                    )
+                    history.add(mapOf(
+                        "role" to obj.getString("role"),
+                        "content" to obj.getString("content")
+                    ))
                 }
-                println("📂 Загружена история из ${historyFile.name} (${history.size} сообщений)")
+                println("📂 Загружена полная история из ${historyFile.name} (${history.size} сообщений)")
                 return
             } catch (e: Exception) {
                 println("⚠️ Не удалось загрузить историю: ${e.message}. Начинаем с чистого листа.")
@@ -58,12 +68,10 @@ class ChatAgent(
         try {
             val jsonArray = JSONArray()
             for (msg in history) {
-                jsonArray.put(
-                    JSONObject().apply {
-                        put("role", msg["role"])
-                        put("content", msg["content"])
-                    }
-                )
+                jsonArray.put(JSONObject().apply {
+                    put("role", msg["role"])
+                    put("content", msg["content"])
+                })
             }
             historyFile.writeText(jsonArray.toString(2), Charsets.UTF_8)
         } catch (e: Exception) {
@@ -71,7 +79,7 @@ class ChatAgent(
         }
     }
 
-    /** Обычный диалог: отправляет сообщение и возвращает ответ модели */
+    /** Обычный диалог с ответом модели и выводом статистики */
     fun sendMessage(userMessage: String): String {
         history.add(mapOf("role" to "user", "content" to userMessage))
         val result: String = try {
@@ -80,16 +88,21 @@ class ChatAgent(
                 .replace(Regex("^[\\s\\S]*?[.!?](\\s|\$)"), { it.value.trim() })
                 .ifBlank { responseText.take(100) }
             history.add(mapOf("role" to "assistant", "content" to trimmed))
-            // Обрезаем историю до system + последние 8 сообщений
-            val systemMsg = history.firstOrNull { it["role"] == "system" }
-            if (systemMsg != null && history.size > 9) {
-                val newHistory = mutableListOf(systemMsg)
-                newHistory.addAll(history.takeLast(8))
-                history.clear()
-                history.addAll(newHistory)
+            // Попытка сжатия, если включено
+            if (compressionEnabled) {
+                maybeCompress()
+            }
+            // Обрезаем полную историю только если сжатие выключено (старая логика)
+            if (!compressionEnabled) {
+                val systemMsg = history.firstOrNull { it["role"] == "system" }
+                if (systemMsg != null && history.size > 9) {
+                    val newHistory = mutableListOf(systemMsg)
+                    newHistory.addAll(history.takeLast(8))
+                    history.clear()
+                    history.addAll(newHistory)
+                }
             }
             saveHistory()
-
             // Вывод статистики токенов (всегда после ответа)
             if (usage != null) {
                 println("Статистика токенов:")
@@ -106,15 +119,26 @@ class ChatAgent(
         return result
     }
 
+    /** Строит список messages для отправки с учётом сжатия */
     private fun chatWithHistory(): Pair<String, JSONObject?> {
         val messages = JSONArray()
-        for (msg in history) {
-            messages.put(
-                JSONObject().apply {
-                    put("role", msg["role"])
-                    put("content", msg["content"])
-                }
-            )
+        if (compressionEnabled && summary != null) {
+            // Добавляем саммари как системное сообщение
+            messages.put(JSONObject().apply {
+                put("role", "system")
+                put("content", "Previous conversation summary:\n$summary")
+            })
+        }
+        // Добавляем последние keepLastMessages сообщений (или все, если их меньше)
+        val startIdx = if (compressionEnabled && keepLastMessages > 0) {
+            maxOf(0, history.size - keepLastMessages)
+        } else 0
+        for (i in startIdx until history.size) {
+            val msg = history[i]
+            messages.put(JSONObject().apply {
+                put("role", msg["role"])
+                put("content", msg["content"])
+            })
         }
 
         val body = JSONObject().apply {
@@ -150,36 +174,90 @@ class ChatAgent(
         return answer to usage
     }
 
-    /**
-     * Быстрый подсчёт токенов для переданного текста.
-     * Текст сохраняется в историю как сообщение пользователя.
-     */
+    /** Проверяет, не пора ли сжать историю, и если да — запрашивает summary у модели */
+    private fun maybeCompress() {
+        val nonSystemMessages = history.filter { it["role"] != "system" }
+        if (nonSystemMessages.size < compressThreshold) return
+
+        // Сообщения, которые ещё не сжаты и находятся за пределами окна keepLastMessages
+        val compressEndIdx = maxOf(1, history.size - keepLastMessages) // не трогаем system
+        if (compressEndIdx <= lastCompressedIndex) return // уже сжато достаточно
+
+        // Собираем текст для суммаризации
+        val toCompress = history.subList(lastCompressedIndex, compressEndIdx)
+            .filter { it["role"] != "system" }
+            .joinToString("\n") { "${it["role"]}: ${it["content"]}" }
+
+        if (toCompress.isBlank()) return
+
+        // Запрашиваем summary
+        val prompt = "Summarize the following conversation fragment in a concise way (2-3 sentences), " +
+                "keeping all important facts, names, decisions and context:\n\n$toCompress\n\nSummary:"
+
+        val body = JSONObject().apply {
+            put("model", model)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", prompt)
+                })
+            })
+            put("temperature", 0.0)
+            put("max_tokens", 200)
+        }.toString()
+
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .timeout(Duration.ofSeconds(30))
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
+
+        try {
+            val future: CompletableFuture<HttpResponse<String>> =
+                client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            val response = future.get(30, TimeUnit.SECONDS)
+            if (response.statusCode() == 200) {
+                val json = JSONObject(response.body())
+                val newSummary = json.getJSONArray("choices")
+                    .getJSONObject(0)
+                    .getJSONObject("message")
+                    .getString("content")
+                summary = if (summary != null) "$summary\n$newSummary" else newSummary
+                lastCompressedIndex = compressEndIdx
+                println("📝 История сжата (сообщений до индекса $lastCompressedIndex)")
+            } else {
+                println("⚠️ Не удалось сжать историю: ${response.statusCode()}")
+            }
+        } catch (e: Exception) {
+            println("⚠️ Ошибка при сжатии истории: ${e.message}")
+        }
+    }
+
+    /** Быстрый подсчёт токенов для текста (без ответа модели) */
     fun countTokensAndSave(text: String): Int {
         history.add(mapOf("role" to "user", "content" to text))
         saveHistory()
 
         val messages = JSONArray()
-        messages.put(
-            JSONObject().apply {
-                put("role", "user")
-                put("content", text)
-            }
-        )
+        messages.put(JSONObject().apply {
+            put("role", "user")
+            put("content", text)
+        })
 
         val body = JSONObject().apply {
             put("model", model)
             put("messages", messages)
             put("temperature", 0.0)
             put("max_tokens", 1)
-            put(
-                "stop", JSONArray().apply {
-                    put("\n")
-                    put(".")
-                    put(" ")
-                    put("Token")
-                    put("Подсчёт")
-                }
-            )
+            put("stop", JSONArray().apply {
+                put("\n")
+                put(".")
+                put(" ")
+                put("Token")
+                put("Подсчёт")
+            })
         }.toString()
 
         val request = HttpRequest.newBuilder()
@@ -208,14 +286,19 @@ class ChatAgent(
         val systemMsg = history.firstOrNull { it["role"] == "system" }
         history.clear()
         if (systemMsg != null) history.add(systemMsg)
+        summary = null
+        lastCompressedIndex = 1 // после system
         saveHistory()
-        println("🔄 История сброшена.")
+        println("🔄 История и саммари сброшены.")
     }
 
     fun save() {
         saveHistory()
-        println("💾 История сохранена в ${historyFile.name}")
+        println("💾 Полная история сохранена в ${historyFile.name}")
     }
+
+    fun getSummary(): String? = summary
+    fun getFullHistorySize() = history.size
 }
 
 fun main() {
@@ -233,13 +316,12 @@ fun main() {
     )
 
     val scanner = Scanner(System.`in`, "UTF-8")
-    println("ChatAgent (DeepSeek) — диалог с автоматической статистикой токенов")
-    println("─".repeat(50))
-    println("Команды:")
-    println("  Обычное сообщение  – отправить агенту")
-    println("  MULTI ... END      – многострочный ввод (для длинных текстов)")
-    println("  tokens <текст>     – подсчитать токены для текста (без ответа)")
-    println("  reset, save, exit")
+    println("ChatAgent (DeepSeek) со сжатием истории")
+    println("─".repeat(60))
+    println("Дополнительные команды:")
+    println("  'compress on'/'compress off' – включить/выключить сжатие")
+    println("  'summary'                   – показать текущее саммари")
+    println("  Остальные команды: MULTI...END, tokens, reset, save, exit")
     println()
 
     val buffer = StringBuilder()
@@ -251,33 +333,56 @@ fun main() {
         multiLineMode = false
         if (content.isEmpty()) return
 
-        // Команда tokens обрабатывается отдельно
-        if (content.startsWith("tokens ", ignoreCase = true)) {
-            val text = content.removePrefix("tokens ").trim()
-            if (text.isEmpty()) {
-                println("Укажите текст после 'tokens'.")
-                return
+        when {
+            content.startsWith("compress ", ignoreCase = true) -> {
+                val cmd = content.removePrefix("compress ").trim().lowercase()
+                when (cmd) {
+                    "on" -> {
+                        agent.compressionEnabled = true
+                        println("✅ Сжатие включено. keepLastMessages=${agent.keepLastMessages}")
+                    }
+                    "off" -> {
+                        agent.compressionEnabled = false
+                        println("✅ Сжатие выключено. Будет использоваться полная история.")
+                    }
+                    else -> println("Используйте: compress on / compress off")
+                }
             }
-            print("Подсчёт токенов... ")
-            val start = System.currentTimeMillis()
-            try {
-                val tokens = agent.countTokensAndSave(text)
+            content.equals("summary", ignoreCase = true) -> {
+                val s = agent.getSummary()
+                if (s != null) {
+                    println("Текущий саммари:\n$s")
+                } else {
+                    println("Саммари пока нет.")
+                }
+            }
+            content.startsWith("tokens ", ignoreCase = true) -> {
+                val text = content.removePrefix("tokens ").trim()
+                if (text.isEmpty()) {
+                    println("Укажите текст после 'tokens'.")
+                    return
+                }
+                print("Подсчёт токенов... ")
+                val start = System.currentTimeMillis()
+                try {
+                    val tokens = agent.countTokensAndSave(text)
+                    val elapsed = (System.currentTimeMillis() - start) / 1000.0
+                    println("${tokens} токенов (за ${"%.1f".format(elapsed)} с)")
+                    println("Текст сохранён в истории.")
+                } catch (e: Exception) {
+                    println("Ошибка: ${e.message}")
+                }
+            }
+            else -> {
+                print("Агент: ")
+                val start = System.currentTimeMillis()
+                val answer = agent.sendMessage(content)
                 val elapsed = (System.currentTimeMillis() - start) / 1000.0
-                println("${tokens} токенов (за ${"%.1f".format(elapsed)} с)")
-                println("Текст сохранён в истории.")
-            } catch (e: Exception) {
-                println("Ошибка: ${e.message}")
+                println(answer)
+                println("(ответ получен за ${"%.1f".format(elapsed)} с)")
             }
-        } else {
-            // Обычный диалог
-            print("Агент: ")
-            val start = System.currentTimeMillis()
-            val answer = agent.sendMessage(content)
-            val elapsed = (System.currentTimeMillis() - start) / 1000.0
-            println(answer)
-            println("(ответ получен за ${"%.1f".format(elapsed)} с)")
         }
-        println("─".repeat(50))
+        println("─".repeat(60))
     }
 
     while (true) {
@@ -285,15 +390,11 @@ fun main() {
             print("Вы: ")
         }
         val line = scanner.nextLine().trimEnd()
-
         when {
-            // Завершение многострочного ввода
             line.equals("END", ignoreCase = true) && multiLineMode -> {
                 processBuffer()
                 continue
             }
-
-            // Начало многострочного ввода
             line.startsWith("MULTI", ignoreCase = true) && !multiLineMode -> {
                 multiLineMode = true
                 val rest = line.removePrefix("MULTI").trim()
@@ -303,8 +404,6 @@ fun main() {
                 println("Многострочный режим. Введите текст. Для отправки введите END.")
                 continue
             }
-
-            // Команды управления (только когда буфер пуст и не в многострочном режиме)
             line.equals("exit", ignoreCase = true) && !multiLineMode && buffer.isEmpty() -> {
                 agent.save()
                 println("Пока!")
@@ -319,13 +418,9 @@ fun main() {
                 agent.save()
                 continue
             }
-
-            // Добавление строки в многострочном режиме
             multiLineMode -> {
                 buffer.appendLine(line)
             }
-
-            // Однострочный ввод
             else -> {
                 if (line.isNotEmpty()) {
                     buffer.append(line)
