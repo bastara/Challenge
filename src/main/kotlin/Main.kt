@@ -12,142 +12,285 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
-class ChatAgent(
+// ----- Стратегии -----
+sealed class Strategy {
+    object SlidingWindow : Strategy()
+    object StickyFacts : Strategy()
+    object Branching : Strategy()
+}
+
+// ----- Состояние ветки -----
+data class BranchState(
+    val name: String,
+    val history: MutableList<Map<String, String>> = mutableListOf()
+)
+
+// ----- Главный агент -----
+class Agent(
     private val apiKey: String,
     private val model: String = "deepseek-chat",
-    systemPrompt: String = "Ты — лаконичный ассистент. Отвечай одним коротким предложением без вступлений и перечислений. Сразу результат.",
-    private val maxTokens: Int = 1000,
-    private val historyFile: File = File("chat_history.json")
+    private val systemPrompt: String = "Ты — полезный ассистент. Отвечай кратко и по делу.",
+    private val maxTokens: Int = 400
 ) {
     private val client = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(30))
         .build()
 
-    // Полная история (включая system prompt)
-    private val history = mutableListOf<Map<String, String>>()
+    private var currentStrategy: Strategy = Strategy.SlidingWindow
 
-    // Параметры сжатия
-    var compressionEnabled = true
-    var keepLastMessages = 8           // последние 8 сообщений (4 пары) не сжимаем
-    var compressThreshold = 12         // сжимать, когда сообщений (без system) > 12
+    // Sliding Window
+    private val slidingHistory = mutableListOf<Map<String, String>>()
+    var slidingWindowSize = 8
+        private set
 
-    // Текущий саммари
-    private var summary: String? = null
-    // Индекс в history, до которого уже сжато (для внутреннего использования)
-    private var lastCompressedIndex = 0
+    // Sticky Facts
+    private val factsHistory = mutableListOf<Map<String, String>>()
+    private var facts = mutableListOf<String>()
+    private val maxFacts = 20
+    var factsWindowSize = 8
+        private set
+
+    // Branching
+    private val branches = mutableMapOf<String, BranchState>()
+    private var activeBranch: String? = null
+    private var checkpoint: List<Map<String, String>>? = null
+
+    // Файлы стратегий
+    private val slidingFile = File("sliding_history.json")
+    private val factsFile = File("sticky_facts_history.json")
+    private val branchesFile = File("branches_history.json")
 
     init {
-        loadHistory(systemPrompt)
+        loadStrategyData(Strategy.SlidingWindow)
     }
 
-    private fun loadHistory(systemPrompt: String) {
-        if (historyFile.exists()) {
+    /** Человекочитаемое название текущей стратегии */
+    fun strategyDisplayName(): String = when (currentStrategy) {
+        Strategy.SlidingWindow -> "Sliding Window"
+        Strategy.StickyFacts -> "Sticky Facts"
+        Strategy.Branching -> "Branching"
+    }
+
+    // ----- Переключение стратегии (с автосохранением предыдущей) -----
+    fun setStrategy(newStrategy: Strategy) {
+        if (newStrategy == currentStrategy) return
+        saveStrategyData(currentStrategy)
+        loadStrategyData(newStrategy)
+        currentStrategy = newStrategy
+    }
+
+    private fun saveStrategyData(strategy: Strategy) {
+        when (strategy) {
+            Strategy.SlidingWindow -> saveSlidingWindow()
+            Strategy.StickyFacts -> saveStickyFacts()
+            Strategy.Branching -> saveBranches()
+        }
+    }
+
+    private fun loadStrategyData(strategy: Strategy) {
+        when (strategy) {
+            Strategy.SlidingWindow -> loadSlidingWindow()
+            Strategy.StickyFacts -> loadStickyFacts()
+            Strategy.Branching -> loadBranches()
+        }
+    }
+
+    // ----- Сохранение / загрузка Sliding Window -----
+    private fun saveSlidingWindow() {
+        val array = JSONArray()
+        slidingHistory.forEach { array.put(JSONObject(it)) }
+        slidingFile.writeText(array.toString(2))
+    }
+
+    private fun loadSlidingWindow() {
+        slidingHistory.clear()
+        if (slidingFile.exists()) {
             try {
-                val jsonStr = historyFile.readText(Charsets.UTF_8)
-                val jsonArray = JSONArray(jsonStr)
-                history.clear()
-                for (i in 0 until jsonArray.length()) {
-                    val obj = jsonArray.getJSONObject(i)
-                    history.add(mapOf(
-                        "role" to obj.getString("role"),
-                        "content" to obj.getString("content")
-                    ))
+                JSONArray(slidingFile.readText()).forEach { obj ->
+                    obj as JSONObject
+                    slidingHistory.add(mapOf("role" to obj.getString("role"), "content" to obj.getString("content")))
                 }
-                println("📂 Загружена полная история из ${historyFile.name} (${history.size} сообщений)")
-                return
-            } catch (e: Exception) {
-                println("⚠️ Не удалось загрузить историю: ${e.message}. Начинаем с чистого листа.")
+            } catch (_: Exception) {
+                slidingHistory.add(mapOf("role" to "system", "content" to systemPrompt))
             }
-        }
-        history.add(mapOf("role" to "system", "content" to systemPrompt))
-        saveHistory()
-        println("🆕 Создана новая история с системным промптом")
-    }
-
-    private fun saveHistory() {
-        try {
-            val jsonArray = JSONArray()
-            for (msg in history) {
-                jsonArray.put(JSONObject().apply {
-                    put("role", msg["role"])
-                    put("content", msg["content"])
-                })
-            }
-            historyFile.writeText(jsonArray.toString(2), Charsets.UTF_8)
-        } catch (e: Exception) {
-            println("❌ Ошибка сохранения истории: ${e.message}")
+        } else {
+            slidingHistory.add(mapOf("role" to "system", "content" to systemPrompt))
+            saveSlidingWindow()
         }
     }
 
-    /** Обычный диалог с ответом модели и выводом статистики */
+    // ----- Сохранение / загрузка Sticky Facts -----
+    private fun saveStickyFacts() {
+        val root = JSONObject()
+        root.put("facts", JSONArray(facts))
+        root.put("history", JSONArray().apply {
+            factsHistory.forEach { put(JSONObject(it)) }
+        })
+        factsFile.writeText(root.toString(2))
+    }
+
+    private fun loadStickyFacts() {
+        factsHistory.clear()
+        facts.clear()
+        if (factsFile.exists()) {
+            try {
+                val root = JSONObject(factsFile.readText())
+                root.getJSONArray("facts").forEach { facts.add(it as String) }
+                root.getJSONArray("history").forEach { obj ->
+                    obj as JSONObject
+                    factsHistory.add(mapOf("role" to obj.getString("role"), "content" to obj.getString("content")))
+                }
+            } catch (_: Exception) {
+                factsHistory.add(mapOf("role" to "system", "content" to systemPrompt))
+            }
+        } else {
+            factsHistory.add(mapOf("role" to "system", "content" to systemPrompt))
+            saveStickyFacts()
+        }
+    }
+
+    // ----- Сохранение / загрузка Branching -----
+    private fun saveBranches() {
+        val root = JSONObject()
+        root.put("activeBranch", activeBranch ?: "")
+        val branchesObj = JSONObject()
+        branches.forEach { (name, state) ->
+            branchesObj.put(name, JSONArray().apply {
+                state.history.forEach { put(JSONObject(it)) }
+            })
+        }
+        root.put("branches", branchesObj)
+        checkpoint?.let { cp ->
+            root.put("checkpoint", JSONArray().apply { cp.forEach { put(JSONObject(it)) } })
+        }
+        branchesFile.writeText(root.toString(2))
+    }
+
+    private fun loadBranches() {
+        branches.clear(); activeBranch = null; checkpoint = null
+        if (branchesFile.exists()) {
+            try {
+                val root = JSONObject(branchesFile.readText())
+                activeBranch = root.optString("activeBranch", "").ifBlank { null }
+                root.getJSONObject("branches").keys().forEach { key ->
+                    val arr = root.getJSONObject("branches").getJSONArray(key)
+                    val hist = mutableListOf<Map<String, String>>()
+                    arr.forEach { obj -> obj as JSONObject; hist.add(mapOf("role" to obj.getString("role"), "content" to obj.getString("content"))) }
+                    branches[key] = BranchState(key, hist)
+                }
+                if (root.has("checkpoint")) {
+                    checkpoint = root.getJSONArray("checkpoint").map { obj -> obj as JSONObject; mapOf("role" to obj.getString("role"), "content" to obj.getString("content")) }
+                }
+                if (activeBranch == null && branches.isNotEmpty()) activeBranch = branches.keys.first()
+            } catch (_: Exception) {
+                branches["main"] = BranchState("main", mutableListOf(mapOf("role" to "system", "content" to systemPrompt)))
+                activeBranch = "main"
+            }
+        } else {
+            branches["main"] = BranchState("main", mutableListOf(mapOf("role" to "system", "content" to systemPrompt)))
+            activeBranch = "main"
+            saveBranches()
+        }
+    }
+
+    // ----- Отправка сообщения (автосохранение после ответа) -----
     fun sendMessage(userMessage: String): String {
-        history.add(mapOf("role" to "user", "content" to userMessage))
-        val result: String = try {
-            val (responseText, usage) = chatWithHistory()
-            var trimmed = responseText
-                .replace(Regex("^[\\s\\S]*?[.!?](\\s|\$)"), { it.value.trim() })
-                .ifBlank { responseText.take(100) }
-            history.add(mapOf("role" to "assistant", "content" to trimmed))
-            // Попытка сжатия, если включено
-            if (compressionEnabled) {
-                maybeCompress()
-            }
-            // Обрезаем полную историю только если сжатие выключено (старая логика)
-            if (!compressionEnabled) {
-                val systemMsg = history.firstOrNull { it["role"] == "system" }
-                if (systemMsg != null && history.size > 9) {
-                    val newHistory = mutableListOf(systemMsg)
-                    newHistory.addAll(history.takeLast(8))
-                    history.clear()
-                    history.addAll(newHistory)
-                }
-            }
-            saveHistory()
-            // Вывод статистики токенов (всегда после ответа)
-            if (usage != null) {
-                println("Статистика токенов:")
-                println("  - Вход (вся история + промпт): ${usage.optInt("prompt_tokens")} токенов")
-                println("  - Сгенерировано (ответ модели):  ${usage.optInt("completion_tokens")} токенов")
-                println("  - Всего за запрос:              ${usage.optInt("total_tokens")} токенов")
-            }
-            trimmed
-        } catch (e: TimeoutException) {
-            "Таймаут (30 с) – модель не успела ответить."
-        } catch (e: Exception) {
-            "Ошибка API: ${e.message ?: e.javaClass.simpleName}"
+        val result = when (currentStrategy) {
+            Strategy.SlidingWindow -> sendSlidingWindow(userMessage)
+            Strategy.StickyFacts -> sendStickyFacts(userMessage)
+            Strategy.Branching -> sendBranching(userMessage)
         }
+        saveStrategyData(currentStrategy)   // сохраняем сразу после ответа
         return result
     }
 
-    /** Строит список messages для отправки с учётом сжатия */
-    private fun chatWithHistory(): Pair<String, JSONObject?> {
-        val messages = JSONArray()
-        if (compressionEnabled && summary != null) {
-            // Добавляем саммари как системное сообщение
-            messages.put(JSONObject().apply {
-                put("role", "system")
-                put("content", "Previous conversation summary:\n$summary")
-            })
-        }
-        // Добавляем последние keepLastMessages сообщений (или все, если их меньше)
-        val startIdx = if (compressionEnabled && keepLastMessages > 0) {
-            maxOf(0, history.size - keepLastMessages)
-        } else 0
-        for (i in startIdx until history.size) {
-            val msg = history[i]
-            messages.put(JSONObject().apply {
-                put("role", msg["role"])
-                put("content", msg["content"])
-            })
-        }
+    // ----- Sliding Window -----
+    private fun sendSlidingWindow(userMessage: String): String {
+        slidingHistory.add(mapOf("role" to "user", "content" to userMessage))
+        val (answer, _) = callApi(slidingHistory.takeLast(slidingWindowSize))
+        slidingHistory.add(mapOf("role" to "assistant", "content" to answer))
+        return answer
+    }
 
+    // ----- Sticky Facts -----
+    private fun sendStickyFacts(userMessage: String): String {
+        factsHistory.add(mapOf("role" to "user", "content" to userMessage))
+        val messages = buildFactsMessages()
+        val (answer, _) = callApi(messages)
+        factsHistory.add(mapOf("role" to "assistant", "content" to answer))
+        updateFacts()
+        return answer
+    }
+
+    private fun buildFactsMessages(): List<Map<String, String>> {
+        val result = mutableListOf<Map<String, String>>()
+        factsHistory.firstOrNull { it["role"] == "system" }?.let { result.add(it) }
+        if (facts.isNotEmpty()) {
+            result.add(mapOf("role" to "system", "content" to "Current facts:\n${facts.joinToString("\n") { "- $it" }}"))
+        }
+        result.addAll(factsHistory.filter { it["role"] != "system" }.takeLast(factsWindowSize))
+        return result
+    }
+
+    private fun updateFacts() {
+        val lastMessages = factsHistory.filter { it["role"] != "system" }.takeLast(6)
+        if (lastMessages.isEmpty()) return
+        val prompt = """
+            Extract important facts from the following conversation fragment.
+            Return each fact on a new line in the format "- [key]: [value]". If nothing new, return "none".
+            
+            ${lastMessages.joinToString("\n") { "${it["role"]}: ${it["content"]}" }}
+        """.trimIndent()
+        val (extracted, _) = callApi(listOf(mapOf("role" to "user", "content" to prompt)), maxTokens = 150)
+        if (!extracted.contains("none", true) && extracted.isNotBlank()) {
+            val newFacts = extracted.split("\n").map { it.removePrefix("- ").trim() }.filter { it.isNotBlank() }
+            facts.addAll(newFacts)
+            if (facts.size > maxFacts) facts = facts.takeLast(maxFacts).toMutableList()
+        }
+    }
+
+    // ----- Branching -----
+    private fun sendBranching(userMessage: String): String {
+        val branch = branches[activeBranch] ?: error("No active branch")
+        branch.history.add(mapOf("role" to "user", "content" to userMessage))
+        val (answer, _) = callApi(branch.history)
+        branch.history.add(mapOf("role" to "assistant", "content" to answer))
+        return answer
+    }
+
+    fun createCheckpoint() {
+        if (currentStrategy != Strategy.Branching) { println("Только в Branching."); return }
+        checkpoint = branches[activeBranch]?.history?.toList()
+        println("Checkpoint сохранён.")
+    }
+
+    fun createBranch(name: String) {
+        if (currentStrategy != Strategy.Branching) { println("Только в Branching."); return }
+        if (checkpoint == null) { println("Сначала checkpoint."); return }
+        branches[name] = BranchState(name, checkpoint!!.map { it.toMutableMap() }.toMutableList())
+        activeBranch = name
+        println("Ветка '$name' создана.")
+    }
+
+    fun switchBranch(name: String) {
+        if (currentStrategy != Strategy.Branching) { println("Только в Branching."); return }
+        if (branches.containsKey(name)) { activeBranch = name; println("Перешли в '$name'.") }
+        else println("Ветка '$name' не найдена.")
+    }
+
+    fun listBranches() {
+        if (currentStrategy != Strategy.Branching) { println("Только в Branching."); return }
+        branches.forEach { (name, state) -> println("${if (name == activeBranch) "*" else " "} $name (${state.history.size} сообщ.)") }
+    }
+
+    // ----- Вызов API -----
+    private fun callApi(messages: List<Map<String, String>>, maxTokens: Int = this.maxTokens, temperature: Double = 0.0): Pair<String, JSONObject?> {
         val body = JSONObject().apply {
             put("model", model)
-            put("messages", messages)
-            put("temperature", 0.0)
+            put("messages", JSONArray().apply { messages.forEach { put(JSONObject(it)) } })
+            put("temperature", temperature)
             put("max_tokens", maxTokens)
         }.toString()
-
         val request = HttpRequest.newBuilder()
             .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
             .header("Content-Type", "application/json")
@@ -155,277 +298,124 @@ class ChatAgent(
             .timeout(Duration.ofSeconds(30))
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .build()
-
-        val future: CompletableFuture<HttpResponse<String>> =
-            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-        val response = future.get(30, TimeUnit.SECONDS)
-
-        if (response.statusCode() != 200) {
-            val errorBody = response.body()
-            throw RuntimeException("API error ${response.statusCode()}: $errorBody")
-        }
-
+        val response = CompletableFuture.supplyAsync { client.send(request, HttpResponse.BodyHandlers.ofString()) }.get(30, TimeUnit.SECONDS)
+        if (response.statusCode() != 200) throw RuntimeException("API error ${response.statusCode()}: ${response.body()}")
         val json = JSONObject(response.body())
-        val answer = json.getJSONArray("choices")
-            .getJSONObject(0)
-            .getJSONObject("message")
-            .getString("content")
-        val usage = json.optJSONObject("usage")
-        return answer to usage
-    }
-
-    /** Проверяет, не пора ли сжать историю, и если да — запрашивает summary у модели */
-    private fun maybeCompress() {
-        val nonSystemMessages = history.filter { it["role"] != "system" }
-        if (nonSystemMessages.size < compressThreshold) return
-
-        // Сообщения, которые ещё не сжаты и находятся за пределами окна keepLastMessages
-        val compressEndIdx = maxOf(1, history.size - keepLastMessages) // не трогаем system
-        if (compressEndIdx <= lastCompressedIndex) return // уже сжато достаточно
-
-        // Собираем текст для суммаризации
-        val toCompress = history.subList(lastCompressedIndex, compressEndIdx)
-            .filter { it["role"] != "system" }
-            .joinToString("\n") { "${it["role"]}: ${it["content"]}" }
-
-        if (toCompress.isBlank()) return
-
-        // Запрашиваем summary
-        val prompt = "Summarize the following conversation fragment in a concise way (2-3 sentences), " +
-                "keeping all important facts, names, decisions and context:\n\n$toCompress\n\nSummary:"
-
-        val body = JSONObject().apply {
-            put("model", model)
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", prompt)
-                })
-            })
-            put("temperature", 0.0)
-            put("max_tokens", 200)
-        }.toString()
-
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $apiKey")
-            .timeout(Duration.ofSeconds(30))
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
-
-        try {
-            val future: CompletableFuture<HttpResponse<String>> =
-                client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-            val response = future.get(30, TimeUnit.SECONDS)
-            if (response.statusCode() == 200) {
-                val json = JSONObject(response.body())
-                val newSummary = json.getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content")
-                summary = if (summary != null) "$summary\n$newSummary" else newSummary
-                lastCompressedIndex = compressEndIdx
-                println("📝 История сжата (сообщений до индекса $lastCompressedIndex)")
-            } else {
-                println("⚠️ Не удалось сжать историю: ${response.statusCode()}")
-            }
-        } catch (e: Exception) {
-            println("⚠️ Ошибка при сжатии истории: ${e.message}")
-        }
-    }
-
-    /** Быстрый подсчёт токенов для текста (без ответа модели) */
-    fun countTokensAndSave(text: String): Int {
-        history.add(mapOf("role" to "user", "content" to text))
-        saveHistory()
-
-        val messages = JSONArray()
-        messages.put(JSONObject().apply {
-            put("role", "user")
-            put("content", text)
-        })
-
-        val body = JSONObject().apply {
-            put("model", model)
-            put("messages", messages)
-            put("temperature", 0.0)
-            put("max_tokens", 1)
-            put("stop", JSONArray().apply {
-                put("\n")
-                put(".")
-                put(" ")
-                put("Token")
-                put("Подсчёт")
-            })
-        }.toString()
-
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $apiKey")
-            .timeout(Duration.ofSeconds(30))
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
-
-        val future: CompletableFuture<HttpResponse<String>> =
-            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-        val response = future.get(30, TimeUnit.SECONDS)
-
-        if (response.statusCode() != 200) {
-            val errorBody = response.body()
-            throw RuntimeException("API error ${response.statusCode()}: $errorBody")
-        }
-
-        val json = JSONObject(response.body())
-        val usage = json.getJSONObject("usage")
-        return usage.getInt("prompt_tokens")
+        val answer = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+        return answer to json.optJSONObject("usage")
     }
 
     fun reset() {
-        val systemMsg = history.firstOrNull { it["role"] == "system" }
-        history.clear()
-        if (systemMsg != null) history.add(systemMsg)
-        summary = null
-        lastCompressedIndex = 1 // после system
-        saveHistory()
-        println("🔄 История и саммари сброшены.")
+        when (currentStrategy) {
+            Strategy.SlidingWindow -> { slidingHistory.clear(); slidingHistory.add(mapOf("role" to "system", "content" to systemPrompt)); saveSlidingWindow() }
+            Strategy.StickyFacts -> { factsHistory.clear(); facts.clear(); factsHistory.add(mapOf("role" to "system", "content" to systemPrompt)); saveStickyFacts() }
+            Strategy.Branching -> {
+                branches.clear(); activeBranch = null; checkpoint = null
+                branches["main"] = BranchState("main", mutableListOf(mapOf("role" to "system", "content" to systemPrompt)))
+                activeBranch = "main"; saveBranches()
+            }
+        }
+        println("Стратегия ${strategyDisplayName()} сброшена.")
     }
 
-    fun save() {
-        saveHistory()
-        println("💾 Полная история сохранена в ${historyFile.name}")
+    fun printHistory() {
+        val h = when (currentStrategy) {
+            Strategy.SlidingWindow -> slidingHistory
+            Strategy.StickyFacts -> factsHistory
+            Strategy.Branching -> branches[activeBranch]?.history ?: emptyList()
+        }
+        h.forEach { println("${it["role"]}: ${it["content"]}") }
     }
 
-    fun getSummary(): String? = summary
-    fun getFullHistorySize() = history.size
+    fun printFacts() {
+        if (currentStrategy != Strategy.StickyFacts) println("Только в Sticky Facts.")
+        else if (facts.isEmpty()) println("Фактов нет.")
+        else facts.forEach { println("- $it") }
+    }
+
+    fun getCurrentStrategy() = currentStrategy
 }
 
+// ----- CLI -----
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
-    System.setErr(PrintStream(System.err, true, "UTF-8"))
-
-    val apiKey = System.getenv("DEEPSEEK_API_KEY")
-        ?: error("Установите переменную окружения DEEPSEEK_API_KEY")
-
-    val agent = ChatAgent(
-        apiKey = apiKey,
-        model = "deepseek-chat",
-        systemPrompt = "Ты — лаконичный ассистент. Отвечай одним коротким предложением без вступлений и перечислений. Сразу результат.",
-        maxTokens = 1000
-    )
-
+    val apiKey = System.getenv("DEEPSEEK_API_KEY") ?: error("DEEPSEEK_API_KEY не задан")
+    val agent = Agent(apiKey, systemPrompt = "Ты — ассистент для сбора ТЗ. Задавай уточняющие вопросы.")
     val scanner = Scanner(System.`in`, "UTF-8")
-    println("ChatAgent (DeepSeek) со сжатием истории")
-    println("─".repeat(60))
-    println("Дополнительные команды:")
-    println("  'compress on'/'compress off' – включить/выключить сжатие")
-    println("  'summary'                   – показать текущее саммари")
-    println("  Остальные команды: MULTI...END, tokens, reset, save, exit")
-    println()
 
-    val buffer = StringBuilder()
-    var multiLineMode = false
+    fun printHelp() {
+        println("=".repeat(50))
+        println("Текущая стратегия: ${agent.strategyDisplayName()}")
+        println("─".repeat(50))
+        println("Общие команды:")
+        println("  help / ?                – эта справка")
+        println("  strategy <имя>          – переключить стратегию (sliding, facts, branching)")
+        println("  history                 – показать историю текущей стратегии")
+        println("  reset                   – сбросить историю текущей стратегии")
+        println("  exit                    – выход")
 
-    fun processBuffer() {
-        val content = buffer.toString().trim()
-        buffer.clear()
-        multiLineMode = false
-        if (content.isEmpty()) return
+        when (agent.getCurrentStrategy()) {
+            Strategy.SlidingWindow -> {
+                println("─".repeat(50))
+                println("Команды Sliding Window:")
+                println("  window <N>              – размер окна (по умолчанию ${agent.slidingWindowSize})")
+            }
+            Strategy.StickyFacts -> {
+                println("─".repeat(50))
+                println("Команды Sticky Facts:")
+                println("  facts                   – показать извлечённые факты")
+                println("  window <N>              – размер окна (по умолчанию ${agent.factsWindowSize})")
+            }
+            Strategy.Branching -> {
+                println("─".repeat(50))
+                println("Команды Branching:")
+                println("  checkpoint              – сохранить точку ветвления")
+                println("  branch <имя>            – создать новую ветку от checkpoint")
+                println("  switch <имя>            – переключиться на другую ветку")
+                println("  branches                – показать список веток")
+            }
+        }
+        println("─".repeat(50))
+        println("Приглашение: [${agent.strategyDisplayName()}] Вы: (введите сообщение)")
+        println("=".repeat(50))
+    }
 
+    printHelp() // приветствие при запуске
+
+    while (true) {
+        val prompt = when (agent.getCurrentStrategy()) {
+            Strategy.SlidingWindow -> "[Sliding]"
+            Strategy.StickyFacts -> "[Sticky]"
+            Strategy.Branching -> "[Branching]"
+        }
+        print("$prompt Вы: ")
+        val input = scanner.nextLine().trim()
         when {
-            content.startsWith("compress ", ignoreCase = true) -> {
-                val cmd = content.removePrefix("compress ").trim().lowercase()
-                when (cmd) {
-                    "on" -> {
-                        agent.compressionEnabled = true
-                        println("✅ Сжатие включено. keepLastMessages=${agent.keepLastMessages}")
-                    }
-                    "off" -> {
-                        agent.compressionEnabled = false
-                        println("✅ Сжатие выключено. Будет использоваться полная история.")
-                    }
-                    else -> println("Используйте: compress on / compress off")
+            input.equals("exit", true) -> break
+            input.equals("help", true) || input.equals("?") -> printHelp()
+            input.startsWith("strategy ", true) -> {
+                val newStrategy = when (input.removePrefix("strategy ").trim().lowercase()) {
+                    "sliding" -> Strategy.SlidingWindow
+                    "facts" -> Strategy.StickyFacts
+                    "branching" -> Strategy.Branching
+                    else -> { println("Неизвестная стратегия."); continue }
                 }
+                agent.setStrategy(newStrategy)
+                println("Стратегия изменена на ${agent.strategyDisplayName()}.")
             }
-            content.equals("summary", ignoreCase = true) -> {
-                val s = agent.getSummary()
-                if (s != null) {
-                    println("Текущий саммари:\n$s")
-                } else {
-                    println("Саммари пока нет.")
-                }
-            }
-            content.startsWith("tokens ", ignoreCase = true) -> {
-                val text = content.removePrefix("tokens ").trim()
-                if (text.isEmpty()) {
-                    println("Укажите текст после 'tokens'.")
-                    return
-                }
-                print("Подсчёт токенов... ")
-                val start = System.currentTimeMillis()
-                try {
-                    val tokens = agent.countTokensAndSave(text)
-                    val elapsed = (System.currentTimeMillis() - start) / 1000.0
-                    println("${tokens} токенов (за ${"%.1f".format(elapsed)} с)")
-                    println("Текст сохранён в истории.")
-                } catch (e: Exception) {
-                    println("Ошибка: ${e.message}")
-                }
-            }
+            input.equals("checkpoint", true) -> agent.createCheckpoint()
+            input.startsWith("branch ", true) -> agent.createBranch(input.removePrefix("branch ").trim())
+            input.startsWith("switch ", true) -> agent.switchBranch(input.removePrefix("switch ").trim())
+            input.equals("branches", true) -> agent.listBranches()
+            input.equals("facts", true) -> agent.printFacts()
+            input.equals("history", true) -> agent.printHistory()
+            input.equals("reset", true) -> agent.reset()
+            input.isEmpty() -> continue
             else -> {
                 print("Агент: ")
                 val start = System.currentTimeMillis()
-                val answer = agent.sendMessage(content)
-                val elapsed = (System.currentTimeMillis() - start) / 1000.0
-                println(answer)
-                println("(ответ получен за ${"%.1f".format(elapsed)} с)")
-            }
-        }
-        println("─".repeat(60))
-    }
-
-    while (true) {
-        if (!multiLineMode) {
-            print("Вы: ")
-        }
-        val line = scanner.nextLine().trimEnd()
-        when {
-            line.equals("END", ignoreCase = true) && multiLineMode -> {
-                processBuffer()
-                continue
-            }
-            line.startsWith("MULTI", ignoreCase = true) && !multiLineMode -> {
-                multiLineMode = true
-                val rest = line.removePrefix("MULTI").trim()
-                if (rest.isNotEmpty()) {
-                    buffer.append(rest)
-                }
-                println("Многострочный режим. Введите текст. Для отправки введите END.")
-                continue
-            }
-            line.equals("exit", ignoreCase = true) && !multiLineMode && buffer.isEmpty() -> {
-                agent.save()
-                println("Пока!")
-                break
-            }
-            line.equals("reset", ignoreCase = true) && !multiLineMode && buffer.isEmpty() -> {
-                buffer.clear()
-                agent.reset()
-                continue
-            }
-            line.equals("save", ignoreCase = true) && !multiLineMode && buffer.isEmpty() -> {
-                agent.save()
-                continue
-            }
-            multiLineMode -> {
-                buffer.appendLine(line)
-            }
-            else -> {
-                if (line.isNotEmpty()) {
-                    buffer.append(line)
-                    processBuffer()
-                }
+                println(agent.sendMessage(input))
+                println("(за ${"%.1f".format((System.currentTimeMillis() - start) / 1000.0)} с)")
             }
         }
     }
