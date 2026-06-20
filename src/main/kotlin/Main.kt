@@ -34,9 +34,13 @@ class TaskAgent(
     // Состояние задачи
     private val taskState = TaskState()
 
+    // Инварианты
+    private val invariants = mutableListOf<String>()
+
     // Файлы
     private val historyFile = File("task_history.json")
     private val stateFile = File("task_state.json")
+    private val invariantsFile = File("invariants.json")
 
     init {
         loadAll()
@@ -49,11 +53,13 @@ class TaskAgent(
     private fun loadAll() {
         loadHistory()
         loadTaskState()
+        loadInvariants()
     }
 
     private fun saveAll() {
         saveHistory()
         saveTaskState()
+        saveInvariants()
     }
 
     private fun loadHistory() {
@@ -64,8 +70,7 @@ class TaskAgent(
                     obj as JSONObject
                     shortTermHistory.add(mapOf("role" to obj.getString("role"), "content" to obj.getString("content")))
                 }
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) { }
         }
     }
 
@@ -99,12 +104,53 @@ class TaskAgent(
         stateFile.writeText(json.toString(2))
     }
 
+    private fun loadInvariants() {
+        if (invariantsFile.exists()) {
+            try {
+                invariants.clear()
+                JSONArray(invariantsFile.readText()).forEach { invariants.add(it as String) }
+            } catch (_: Exception) { }
+        }
+    }
+
+    private fun saveInvariants() {
+        invariantsFile.writeText(JSONArray(invariants).toString(2))
+    }
+
     private fun resetTaskState() {
         taskState.phase = "idle"
         taskState.step = ""
         taskState.expectedAction = ""
         taskState.context.clear()
         saveTaskState()
+    }
+
+    // ----- Управление инвариантами -----
+    fun addInvariant(rule: String): String {
+        invariants.add(rule)
+        saveInvariants()
+        return "Инвариант добавлен (всего ${invariants.size})."
+    }
+
+    fun removeInvariant(index: Int): String {
+        return if (index in 0 until invariants.size) {
+            val removed = invariants.removeAt(index)
+            saveInvariants()
+            "Удалён инвариант: $removed"
+        } else {
+            "Неверный индекс. Используйте invariant list, чтобы увидеть номера."
+        }
+    }
+
+    fun listInvariants(): String {
+        if (invariants.isEmpty()) return "Инварианты не заданы."
+        return invariants.withIndex().joinToString("\n") { "${it.index}: ${it.value}" }
+    }
+
+    fun clearInvariants(): String {
+        invariants.clear()
+        saveInvariants()
+        return "Инварианты очищены."
     }
 
     // ----- Управление задачей -----
@@ -126,21 +172,16 @@ class TaskAgent(
                 taskState.step = "Выполнение шага 1"
                 taskState.expectedAction = "Выполните действие или введите 'step <результат>'"
             }
-
             "execution" -> {
-                // Можно добавить логику перехода к validation после N шагов
                 taskState.phase = "validation"
                 taskState.step = "Проверка результатов"
-                taskState.expectedAction =
-                    "Проверьте результат и введите 'complete' для завершения или 'step <замечание>' для доработки"
+                taskState.expectedAction = "Проверьте результат и введите 'complete' для завершения или 'step <замечание>' для доработки"
             }
-
             "validation" -> {
                 taskState.phase = "done"
                 taskState.step = "Задача завершена"
                 taskState.expectedAction = ""
             }
-
             "done" -> return "Задача уже завершена. Введите 'start <описание>' для новой."
         }
         saveAll()
@@ -171,7 +212,6 @@ class TaskAgent(
         if (taskState.phase == "done") {
             return "Сохранённая задача уже завершена. Введите 'start <описание>' для новой."
         }
-        // Всё уже загружено в taskState, просто информируем
         return "Задача возобновлена. Этап: ${taskState.phase}, шаг: '${taskState.step}'. ${taskState.expectedAction}"
     }
 
@@ -188,19 +228,20 @@ class TaskAgent(
 
     fun showStatus(): String {
         if (taskState.phase == "idle") return "Нет активной задачи."
-        return "Этап: ${taskState.phase}\nШаг: ${taskState.step}\nОжидаемое действие: ${taskState.expectedAction}\nКонтекст: ${
-            taskState.context.joinToString(
-                "; "
-            )
-        }"
+        return """
+            Этап: ${taskState.phase}
+            Шаг: ${taskState.step}
+            Ожидаемое действие: ${taskState.expectedAction}
+            Контекст: ${taskState.context.joinToString("; ")}
+        """.trimIndent()
     }
 
-    // ----- Отправка сообщения (с учётом состояния задачи) -----
+    // ----- Отправка сообщения с учётом состояния задачи и инвариантов -----
     fun sendMessage(userMessage: String): String {
-        // Если задача не активна, работаем как обычный чат (без состояния)
+        // Если задача не активна, работаем как обычный чат с инвариантами
         if (taskState.phase == "idle" || taskState.phase == "done") {
             shortTermHistory.add(mapOf("role" to "user", "content" to userMessage))
-            val messages = shortTermHistory.toList()
+            val messages = buildMessages()
             val (answer, _) = callApi(messages)
             shortTermHistory.add(mapOf("role" to "assistant", "content" to answer))
             trimHistory()
@@ -208,13 +249,15 @@ class TaskAgent(
             return answer
         }
 
-        // Иначе добавляем в промпт описание состояния задачи
+        // Активная задача: добавляем контекст задачи и инварианты
         shortTermHistory.add(mapOf("role" to "user", "content" to userMessage))
         val taskContextMessage = buildTaskContextMessage()
+        val invariantMessage = buildInvariantMessage()
         val messages = mutableListOf<Map<String, String>>()
         messages.add(shortTermHistory.first { it["role"] == "system" })
         messages.add(taskContextMessage)
-        messages.addAll(shortTermHistory.drop(1).takeLast(windowSize - 2)) // оставляем место под system и task
+        if (invariantMessage != null) messages.add(invariantMessage)
+        messages.addAll(shortTermHistory.drop(1).takeLast(windowSize - 2 - (if (invariantMessage != null) 1 else 0)))
         val (answer, _) = callApi(messages)
         shortTermHistory.add(mapOf("role" to "assistant", "content" to answer))
         trimHistory()
@@ -233,6 +276,25 @@ class TaskAgent(
         return mapOf("role" to "system", "content" to ctx)
     }
 
+    private fun buildInvariantMessage(): Map<String, String>? {
+        if (invariants.isEmpty()) return null
+        val text = """
+            |Invariants (must not be violated under any circumstances):
+            |${invariants.joinToString("\n") { "- $it" }}
+            |If the user's request conflicts with any of these invariants, refuse politely and explain why.
+        """.trimMargin()
+        return mapOf("role" to "system", "content" to text)
+    }
+
+    private fun buildMessages(): List<Map<String, String>> {
+        val result = mutableListOf<Map<String, String>>()
+        result.add(shortTermHistory.first { it["role"] == "system" })
+        val invariantMsg = buildInvariantMessage()
+        if (invariantMsg != null) result.add(invariantMsg)
+        result.addAll(shortTermHistory.drop(1))
+        return result
+    }
+
     private fun trimHistory() {
         if (shortTermHistory.size > windowSize + 2) {
             val systemMsg = shortTermHistory.first { it["role"] == "system" }
@@ -242,10 +304,7 @@ class TaskAgent(
         }
     }
 
-    private fun callApi(
-        messages: List<Map<String, String>>,
-        maxTokens: Int = this.maxTokens
-    ): Pair<String, JSONObject?> {
+    private fun callApi(messages: List<Map<String, String>>, maxTokens: Int = this.maxTokens): Pair<String, JSONObject?> {
         val body = JSONObject().apply {
             put("model", model)
             put("messages", JSONArray().apply { messages.forEach { put(JSONObject(it)) } })
@@ -267,7 +326,6 @@ class TaskAgent(
         return answer to json.optJSONObject("usage")
     }
 
-    // В классе TaskAgent
     fun reset() {
         resetTaskState()
         shortTermHistory.clear()
@@ -283,18 +341,22 @@ fun main() {
     val agent = TaskAgent(apiKey)
     val scanner = Scanner(System.`in`, "UTF-8")
 
-    println("Агент с конечным автоматом задачи (Task FSM)")
+    println("Агент с конечным автоматом и инвариантами")
     println("Команды:")
-    println("  start <описание>      – начать новую задачу")
-    println("  step <описание>       – зафиксировать выполненный шаг")
-    println("  next                  – перейти к следующему шагу")
-    println("  pause                 – приостановить задачу")
-    println("  resume                – продолжить задачу")
-    println("  status                – показать состояние задачи")
-    println("  complete              – завершить задачу")
-    println("  reset                 – сбросить задачу и историю")
-    println("  help / ?              – справка")
-    println("  exit                  – выход")
+    println("  start <описание>          – начать новую задачу")
+    println("  step <описание>           – зафиксировать выполненный шаг")
+    println("  next                      – перейти к следующему шагу")
+    println("  pause                     – приостановить задачу")
+    println("  resume                    – продолжить задачу")
+    println("  status                    – показать состояние задачи")
+    println("  complete                  – завершить задачу")
+    println("  reset                     – сбросить задачу и историю")
+    println("  invariant add <правило>   – добавить инвариант")
+    println("  invariant remove <номер>  – удалить инвариант по номеру")
+    println("  invariant list            – показать все инварианты")
+    println("  invariant clear           – очистить инварианты")
+    println("  help / ?                  – справка")
+    println("  exit                      – выход")
     println()
 
     while (true) {
@@ -304,41 +366,36 @@ fun main() {
             input.equals("exit", true) -> break
             input.equals("help", true) || input.equals("?") -> {
                 println("start/step/next/pause/resume/status/complete/reset")
+                println("invariant add/remove/list/clear")
             }
-
-            input.startsWith("start ", true) -> {
-                println(agent.startTask(input.removePrefix("start ").trim()))
-            }
-
-            input.startsWith("step ", true) -> {
-                println(agent.recordStep(input.removePrefix("step ").trim()))
-            }
-
-            input.equals("next", true) -> {
-                println(agent.nextStep())
-            }
-
-            input.equals("pause", true) -> {
-                println(agent.pauseTask())
-            }
-
-            input.equals("resume", true) -> {
-                println(agent.resumeTask())
-            }
-
-            input.equals("status", true) -> {
-                println(agent.showStatus())
-            }
-
-            input.equals("complete", true) -> {
-                println(agent.completeTask())
-            }
-
+            input.startsWith("start ", true) -> println(agent.startTask(input.removePrefix("start ").trim()))
+            input.startsWith("step ", true) -> println(agent.recordStep(input.removePrefix("step ").trim()))
+            input.equals("next", true) -> println(agent.nextStep())
+            input.equals("pause", true) -> println(agent.pauseTask())
+            input.equals("resume", true) -> println(agent.resumeTask())
+            input.equals("status", true) -> println(agent.showStatus())
+            input.equals("complete", true) -> println(agent.completeTask())
             input.equals("reset", true) -> {
                 agent.reset()
                 println("Задача и история сброшены.")
             }
-
+            input.startsWith("invariant ", true) -> {
+                val parts = input.removePrefix("invariant ").trim().split(" ", limit = 2)
+                when (parts.getOrElse(0) { "" }) {
+                    "add" -> {
+                        if (parts.size >= 2) println(agent.addInvariant(parts[1]))
+                        else println("Укажите правило: invariant add <текст>")
+                    }
+                    "remove" -> {
+                        val index = parts.getOrElse(1) { "" }.toIntOrNull()
+                        if (index != null) println(agent.removeInvariant(index))
+                        else println("Укажите номер: invariant remove <число>")
+                    }
+                    "list" -> println(agent.listInvariants())
+                    "clear" -> println(agent.clearInvariants())
+                    else -> println("Неизвестная команда. Используйте add, remove, list, clear.")
+                }
+            }
             input.isEmpty() -> continue
             else -> {
                 print("Агент: ")
