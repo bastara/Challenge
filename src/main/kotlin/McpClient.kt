@@ -6,136 +6,105 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.Scanner
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
     val scanner = Scanner(System.`in`, "UTF-8")
-    val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
-
-    val monitorActive = AtomicBoolean(false)
-    var monitorThread: Thread? = null
+    val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
 
     println("Команды:")
-    println("  start <город> [секунд]  – начать сбор и автоматический показ обновлений")
-    println("  report                  – показать все сохранённые данные")
-    println("  stop                    – остановить сбор и мониторинг")
-    println("  clear                   – очистить все данные погоды")
-    println("  exit                    – выход")
+    println("  best <запрос>   – найти лучшее")
+    println("  worst <запрос>  – найти худшее")
+    println("  exit            – выход")
 
     while (true) {
         print("> ")
         val input = scanner.nextLine().trim()
         when {
-            input.equals("exit", true) -> {
-                monitorActive.set(false)
-                monitorThread?.interrupt()
-                break
-            }
-            input.startsWith("start ", true) -> {
-                val parts = input.removePrefix("start ").trim().split(" ")
-                val city = parts[0]
-                val interval = if (parts.size > 1) parts[1].toIntOrNull() ?: 60 else 60
+            input.equals("exit", true) -> break
+            input.startsWith("best ", true) || input.startsWith("worst ", true) -> {
+                val parts = input.split(" ", limit = 2)
+                val criterion = if (parts[0] == "worst") "worst" else "best"
+                val query = parts[1]
 
-                val args = JSONObject().apply {
-                    put("city", city)
-                    put("interval_seconds", interval)
+                // Шаг 1: поиск
+                val searchResultJson = callTool(httpClient, "web_search", JSONObject().apply { put("query", query) })
+                val searchResult = JSONObject(searchResultJson)
+                if (searchResult.has("error")) {
+                    println("Ошибка поиска: ${searchResult.getString("error")}")
+                    continue
                 }
-                val startResponse = sendRequest(httpClient, "start_periodic_weather", args)
-                println(startResponse)
-
-                monitorActive.set(false)
-                monitorThread?.interrupt()
-                monitorThread?.join(1000)
-
-                val initialCount = getRecordCount(httpClient)
-
-                monitorActive.set(true)
-                monitorThread = thread {
-                    var lastCount = initialCount
-                    while (monitorActive.get()) {
-                        Thread.sleep(interval * 1000L)
-                        if (!monitorActive.get()) break
-                        val currentCount = getRecordCount(httpClient)
-                        if (currentCount > lastCount) {
-                            val newRecords = getNewRecords(httpClient, lastCount)
-                            newRecords?.forEach { record ->
-                                val temp = record.optJSONObject("main")?.optDouble("temp")
-                                val desc = record.optJSONArray("weather")?.optJSONObject(0)?.optString("description")
-                                val time = record.optString("collected_at", "?")
-                                println("[${time}] Погода в $city: $temp°C, $desc")
-                            }
-                            lastCount = currentCount
-                        }
-                    }
+                val resultsArray = searchResult.optJSONArray("results")
+                if (resultsArray == null || resultsArray.length() == 0) {
+                    println("Поиск не дал результатов.")
+                    continue
                 }
-            }
-            input.equals("report", true) -> {
-                val response = sendRequest(httpClient, "get_weather_report", null)
-                println(response)
-            }
-            input.equals("stop", true) -> {
-                monitorActive.set(false)
-                monitorThread?.interrupt()
-                val response = sendRequest(httpClient, "stop_periodic_weather", null)
-                println(response)
-            }
-            input.equals("clear", true) -> {
-                val response = sendRequest(httpClient, "clear_weather_data", null)
-                println(response)
+
+                println("\nНайдено ${resultsArray.length()} вариантов:")
+                for (i in 0 until resultsArray.length()) {
+                    val item = resultsArray.getJSONObject(i)
+                    val name = item.optString("name", "Без названия")
+                    val desc = item.optString("description", "")
+                    println("${i + 1}. $name – $desc")
+                }
+
+                // Шаг 2: анализ
+                val summaryResultJson = callTool(httpClient, "summarize", JSONObject().apply {
+                    put("items", resultsArray)
+                    put("criterion", criterion)
+                })
+                val summaryResult = JSONObject(summaryResultJson)
+                if (summaryResult.has("error")) {
+                    println("Ошибка анализа: ${summaryResult.getString("error")}")
+                    continue
+                }
+                val selected = summaryResult.optString("selected", "?")
+                val rating = summaryResult.optInt("rating", 0)
+                val positives = summaryResult.optInt("positives", 0)
+                val negatives = summaryResult.optInt("negatives", 0)
+                val summaryText = summaryResult.optString("summary", "")
+                println("\n${if (criterion == "worst") "Худший" else "Лучший"} вариант: $selected (рейтинг $rating баллов, +$positives / -$negatives)")
+                println(summaryText)
+
+                // Шаг 3: сохранение
+                val saveResultJson = callTool(httpClient, "save_to_file", JSONObject().apply {
+                    put("content", summaryText)
+                })
+                val saveResult = JSONObject(saveResultJson)
+                if (saveResult.has("status")) {
+                    println("\nРезультат сохранён в файл: ${saveResult.optString("file", "summary_output.txt")}")
+                } else {
+                    println("\nОшибка сохранения: $saveResultJson")
+                }
             }
             else -> println("Неизвестная команда")
         }
     }
 }
 
-fun sendRequest(client: HttpClient, toolName: String, arguments: JSONObject?): String {
-    val params = JSONObject().apply {
-        put("name", toolName)
-        if (arguments != null) put("arguments", arguments)
-    }
+fun callTool(client: HttpClient, toolName: String, arguments: JSONObject): String {
     val request = JSONObject().apply {
-        put("jsonrpc", "2.0")
-        put("id", "1")
+        put("jsonrpc", "2.0"); put("id", "1")
         put("method", "tools/call")
-        put("params", params)
+        put("params", JSONObject().apply {
+            put("name", toolName)
+            put("arguments", arguments)
+        })
     }
+
     val httpRequest = HttpRequest.newBuilder()
         .uri(URI.create("http://localhost:8081/mcp"))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(10))
+        .timeout(Duration.ofSeconds(30))
         .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
         .build()
+
     val response = client.send(httpRequest, HttpResponse.BodyHandlers.ofString())
     return if (response.statusCode() == 200) {
         val json = JSONObject(response.body())
-        json.getJSONObject("result").getJSONArray("content").getJSONObject(0).getString("text")
+        val result = json.getJSONObject("result")
+        result.getJSONArray("content").getJSONObject(0).getString("text")
     } else {
         "Ошибка: ${response.statusCode()} ${response.body()}"
-    }
-}
-
-fun getRecordCount(client: HttpClient): Int {
-    val report = sendRequest(client, "get_weather_report", null)
-    return try {
-        val json = JSONObject(report)
-        val reportArray = json.optJSONArray("report")
-        reportArray?.length() ?: 0
-    } catch (e: Exception) {
-        0
-    }
-}
-
-fun getNewRecords(client: HttpClient, fromIndex: Int): List<JSONObject>? {
-    val report = sendRequest(client, "get_weather_report", null)
-    return try {
-        val json = JSONObject(report)
-        val reportArray = json.optJSONArray("report")
-        if (reportArray != null) {
-            (fromIndex until reportArray.length()).map { reportArray.getJSONObject(it) }
-        } else null
-    } catch (e: Exception) {
-        null
     }
 }
