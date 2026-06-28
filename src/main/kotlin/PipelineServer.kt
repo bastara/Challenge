@@ -10,8 +10,6 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 
-private val summaryFile = File("summary_output.txt")
-
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
     System.setErr(PrintStream(System.err, true, "UTF-8"))
@@ -22,12 +20,12 @@ fun main() {
         return
     }
 
-    val server = HttpServer.create(InetSocketAddress(8081), 0)
+    val server = HttpServer.create(InetSocketAddress(8082), 0)
     server.createContext("/mcp") { exchange ->
         if (exchange.requestMethod == "POST") {
             val body = exchange.requestBody.readAllBytes().toString(Charsets.UTF_8)
             val request = JSONObject(body)
-            val response = handleRequest(request, apiKey)
+            val response = handlePipelineRequest(request, apiKey)
             val responseBytes = response.toString().toByteArray()
             exchange.responseHeaders.add("Content-Type", "application/json")
             exchange.sendResponseHeaders(200, responseBytes.size.toLong())
@@ -37,10 +35,10 @@ fun main() {
         }
     }
     server.start()
-    println("MCP-сервер пайплайна (DeepSeek) запущен на http://localhost:8081/mcp")
+    println("Пайплайн MCP-сервер запущен на http://localhost:8082/mcp")
 }
 
-fun handleRequest(request: JSONObject, apiKey: String): JSONObject {
+fun handlePipelineRequest(request: JSONObject, apiKey: String): JSONObject {
     val method = request.getString("method")
     val id = request.opt("id")
 
@@ -50,7 +48,7 @@ fun handleRequest(request: JSONObject, apiKey: String): JSONObject {
             put("result", JSONObject().apply {
                 put("capabilities", JSONObject())
                 put("serverInfo", JSONObject().apply {
-                    put("name", "pipeline-mcp-server"); put("version", "3.0.0")
+                    put("name", "pipeline-server"); put("version", "1.0.0")
                 })
             })
         }
@@ -58,7 +56,7 @@ fun handleRequest(request: JSONObject, apiKey: String): JSONObject {
             val tools = JSONArray().apply {
                 put(JSONObject().apply {
                     put("name", "web_search")
-                    put("description", "Поиск до 5 вариантов по запросу через DeepSeek")
+                    put("description", "Поиск до 10 вариантов по запросу через DeepSeek")
                     put("parameters", JSONObject().apply {
                         put("type", "object")
                         put("properties", JSONObject().apply {
@@ -71,7 +69,7 @@ fun handleRequest(request: JSONObject, apiKey: String): JSONObject {
                 })
                 put(JSONObject().apply {
                     put("name", "summarize")
-                    put("description", "Анализирует варианты, считает рейтинг по тональности и возвращает лучший/худший")
+                    put("description", "Анализирует варианты, считает рейтинг и возвращает лучший/худший")
                     put("parameters", JSONObject().apply {
                         put("type", "object")
                         put("properties", JSONObject().apply {
@@ -83,19 +81,6 @@ fun handleRequest(request: JSONObject, apiKey: String): JSONObject {
                             })
                         })
                         put("required", JSONArray().apply { put("items") })
-                    })
-                })
-                put(JSONObject().apply {
-                    put("name", "save_to_file")
-                    put("description", "Сохраняет текст в файл summary_output.txt")
-                    put("parameters", JSONObject().apply {
-                        put("type", "object")
-                        put("properties", JSONObject().apply {
-                            put("content", JSONObject().apply {
-                                put("type", "string"); put("description", "Текст для сохранения")
-                            })
-                        })
-                        put("required", JSONArray().apply { put("content") })
                     })
                 })
             }
@@ -120,16 +105,6 @@ fun handleRequest(request: JSONObject, apiKey: String): JSONObject {
                     val criterion = arguments.optString("criterion", "best")
                     println("Анализ ${itemsArray.length()} вариантов (критерий: $criterion)")
                     summarizeItems(itemsArray, criterion)
-                }
-                "save_to_file" -> {
-                    val content = arguments.getString("content")
-                    val timestamp = java.time.LocalDateTime.now().toString()
-                    summaryFile.appendText("\n=== $timestamp ===\n$content\n")
-                    println("Сохранено в ${summaryFile.absolutePath}")
-                    JSONObject().apply {
-                        put("status", "saved")
-                        put("file", summaryFile.absolutePath)
-                    }
                 }
                 else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
             }
@@ -156,13 +131,12 @@ fun handleRequest(request: JSONObject, apiKey: String): JSONObject {
 
 fun webSearch(query: String, apiKey: String): JSONObject {
     val prompt = """
-        Ты — поисковый ассистент. Найди информацию по запросу "$query" и верни до 5 результатов.
+        Ты — поисковый ассистент. Найди информацию по запросу "$query" и верни до 10 результатов.
         Для каждого результата ОБЯЗАТЕЛЬНО укажи:
         - name: название места/сервиса
         - description: краткое описание (3-5 предложений)
-        - reviews: массив из 2-4 отзывов, каждый с полями text (текст) и sentiment (1 для положительного, -1 для отрицательного)
-        Количество отзывов и соотношение положительных/отрицательных должно быть разным для каждого варианта и соответствовать реальной репутации.
-        Не делай всем одинаковые оценки. Например, для популярного места может быть 4 положительных и 1 отрицательный, для среднего — 2 и 2, для плохого — 1 и 4.
+        - reviews: массив из 2-5 отзывов, каждый с полями text (текст) и sentiment (1 для положительного, -1 для отрицательного)
+        Количество отзывов и соотношение положительных/отрицательных должно быть разным для каждого варианта.
         Ответ оформи строго как JSON:
         {
           "results": [
@@ -215,10 +189,7 @@ fun webSearch(query: String, apiKey: String): JSONObject {
                 val desc = item.optString("description", "")
                 val sentiment = analyzeSentiment(desc)
                 item.put("reviews", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("text", desc)
-                        put("sentiment", sentiment)
-                    })
+                    put(JSONObject().apply { put("text", desc); put("sentiment", sentiment) })
                 })
             }
         }
@@ -243,70 +214,46 @@ fun analyzeSentiment(text: String): Int {
 }
 
 fun summarizeItems(itemsArray: JSONArray, criterion: String): JSONObject {
-    if (itemsArray.length() == 0) {
-        return JSONObject().apply { put("error", "Пустой список вариантов") }
-    }
+    if (itemsArray.length() == 0) return JSONObject().apply { put("error", "Пустой список вариантов") }
 
     val items = mutableListOf<JSONObject>()
-    for (i in 0 until itemsArray.length()) {
-        items.add(itemsArray.getJSONObject(i))
-    }
+    for (i in 0 until itemsArray.length()) items.add(itemsArray.getJSONObject(i))
 
     data class ItemScore(val name: String, val total: Int, val positives: Int, val negatives: Int)
     val scores = mutableListOf<ItemScore>()
     var bestItem: JSONObject? = null
     var bestScore = if (criterion == "worst") Int.MAX_VALUE else Int.MIN_VALUE
-    var bestPositives = 0
-    var bestNegatives = 0
+    var bestPos = 0; var bestNeg = 0
 
-    val logLines = mutableListOf("Промежуточные оценки:")
     for (item in items) {
         val name = item.optString("name", "Без названия")
         val reviews = item.optJSONArray("reviews") ?: JSONArray()
-        var pos = 0
-        var neg = 0
+        var pos = 0; var neg = 0
         for (j in 0 until reviews.length()) {
             val s = reviews.getJSONObject(j).optInt("sentiment", 0)
             if (s > 0) pos++ else if (s < 0) neg++
         }
         val total = pos - neg
         scores.add(ItemScore(name, total, pos, neg))
-        logLines.add("- $name: $total баллов (+$pos / -$neg)")
-
         val isBetter = if (criterion == "worst") total < bestScore else total > bestScore
-        if (isBetter) {
-            bestScore = total
-            bestItem = item
-            bestPositives = pos
-            bestNegatives = neg
-        }
+        if (isBetter) { bestScore = total; bestItem = item; bestPos = pos; bestNeg = neg }
     }
 
-    logLines.forEach { println(it) }
+    if (bestItem == null) return JSONObject().apply { put("error", "Не удалось выбрать вариант") }
 
-    if (bestItem == null) {
-        return JSONObject().apply { put("error", "Не удалось выбрать вариант") }
-    }
-
-    val bestName = bestItem.getString("name")
-    val bestDesc = bestItem.optString("description", "Описание отсутствует")
     val summary = buildString {
-        val label = if (criterion == "worst") "Худший вариант" else "Лучший вариант"
-        appendLine("$label: $bestName")
-        appendLine("Описание: $bestDesc")
-        appendLine("Рейтинг: $bestScore баллов (+$bestPositives / -$bestNegatives)")
+        appendLine("${if (criterion == "worst") "Худший" else "Лучший"} вариант: ${bestItem.getString("name")}")
+        appendLine("Описание: ${bestItem.optString("description", "")}")
+        appendLine("Рейтинг: $bestScore баллов (+$bestPos / -$bestNeg)")
         appendLine()
         appendLine("Все оценки:")
-        scores.forEach { (n, t, p, ng) -> appendLine("  $n: $t баллов (+$p / -$ng)") }
+        scores.forEach { appendLine("  ${it.name}: ${it.total} баллов (+${it.positives} / -${it.negatives})") }
     }
-
     val truncated = truncateToTokens(summary, 300)
-    println("Выбран: $bestName ($bestScore баллов, +$bestPositives/-$bestNegatives)")
+    println("Выбран: ${bestItem.getString("name")} ($bestScore баллов, +$bestPos/-$bestNeg)")
     return JSONObject().apply {
-        put("selected", bestName)
-        put("rating", bestScore)
-        put("positives", bestPositives)
-        put("negatives", bestNegatives)
+        put("selected", bestItem.getString("name"))
+        put("rating", bestScore); put("positives", bestPos); put("negatives", bestNeg)
         put("summary", truncated)
     }
 }
