@@ -25,13 +25,14 @@ fun callMcpTool(client: HttpClient, serverUrl: String, toolName: String, argumen
     val httpRequest = HttpRequest.newBuilder()
         .uri(URI.create(serverUrl))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(60))
+        .timeout(Duration.ofSeconds(120))
         .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
         .build()
     val response = client.send(httpRequest, HttpResponse.BodyHandlers.ofString())
-    if (response.statusCode() != 200) return """{"error":"HTTP ${response.statusCode()}"}"""
-    val json = JSONObject(response.body())
-    return json.getJSONObject("result").getJSONArray("content").getJSONObject(0).getString("text")
+    if (response.statusCode() != 200) {
+        return """{"error": "HTTP ${response.statusCode()}"}"""
+    }
+    return response.body()
 }
 
 fun fetchTools(client: HttpClient, serverUrl: String): List<String> {
@@ -47,7 +48,7 @@ fun fetchTools(client: HttpClient, serverUrl: String): List<String> {
         val initRequest = HttpRequest.newBuilder()
             .uri(URI.create(serverUrl))
             .header("Content-Type", "application/json")
-            .timeout(Duration.ofSeconds(30))
+            .timeout(Duration.ofSeconds(120))
             .POST(HttpRequest.BodyPublishers.ofString(initBody.toString()))
             .build()
         client.send(initRequest, HttpResponse.BodyHandlers.ofString())
@@ -59,7 +60,7 @@ fun fetchTools(client: HttpClient, serverUrl: String): List<String> {
         val listRequest = HttpRequest.newBuilder()
             .uri(URI.create(serverUrl))
             .header("Content-Type", "application/json")
-            .timeout(Duration.ofSeconds(10))
+            .timeout(Duration.ofSeconds(120))
             .POST(HttpRequest.BodyPublishers.ofString(listBody.toString()))
             .build()
         val listResponse = client.send(listRequest, HttpResponse.BodyHandlers.ofString())
@@ -90,7 +91,7 @@ fun executeComplexFlow(client: HttpClient, router: McpRouter, city: String, thre
     }
     println("1. Запрос погоды на сервере '${weatherServer.name}' (${weatherServer.url})")
     val weatherJson = JSONObject(callMcpTool(client, weatherServer.url, "get_weather", JSONObject().apply { put("city", city) }))
-    if (weatherJson.has("error")) { println("   Ошибка: ${weatherJson.getString("error")}"); return }
+    if (weatherJson.has("error")) { println("   Ошибка: ${weatherJson.opt("error")}"); return }
     val temp = weatherJson.optJSONObject("main")?.optDouble("temp") ?: 0.0
     val desc = weatherJson.optJSONArray("weather")?.optJSONObject(0)?.optString("description") ?: ""
     println("   Погода в $city: $temp°C, $desc")
@@ -104,7 +105,7 @@ fun executeComplexFlow(client: HttpClient, router: McpRouter, city: String, thre
     if (searchServer == null) { println("❌ Инструмент web_search не найден."); return }
     println("2. Поиск отелей на сервере '${searchServer.name}' (${searchServer.url})")
     val searchJson = JSONObject(callMcpTool(client, searchServer.url, "web_search", JSONObject().apply { put("query", "лучший отель в $city") }))
-    if (searchJson.has("error")) { println("   Ошибка: ${searchJson.getString("error")}"); return }
+    if (searchJson.has("error")) { println("   Ошибка: ${searchJson.opt("error")}"); return }
     val results = searchJson.optJSONArray("results")
     if (results == null || results.length() == 0) { println("   Ничего не найдено."); return }
     println("   Найдено ${results.length()} вариантов отелей.")
@@ -114,7 +115,7 @@ fun executeComplexFlow(client: HttpClient, router: McpRouter, city: String, thre
     if (summarizeServer == null) { println("❌ Инструмент summarize не найден."); return }
     println("3. Анализ и выбор лучшего отеля на сервере '${summarizeServer.name}' (${summarizeServer.url})")
     val summaryJson = JSONObject(callMcpTool(client, summarizeServer.url, "summarize", JSONObject().apply { put("items", results); put("criterion", "best") }))
-    if (summaryJson.has("error")) { println("   Ошибка: ${summaryJson.getString("error")}"); return }
+    if (summaryJson.has("error")) { println("   Ошибка: ${summaryJson.opt("error")}"); return }
     val selected = summaryJson.optString("selected", "?")
     val rating = summaryJson.optInt("rating", 0)
     val pos = summaryJson.optInt("positives", 0)
@@ -130,7 +131,7 @@ fun executeComplexFlow(client: HttpClient, router: McpRouter, city: String, thre
     if (saveJson.has("status")) {
         println("   Результат сохранён в файл: ${saveJson.optString("file", "summary_output.txt")}")
     } else {
-        println("   Ошибка сохранения: $saveJson")
+        println("   Ошибка сохранения: ${saveJson.opt("error") ?: saveJson}")
     }
     println("=== Длинный флоу завершён ===\n")
 }
@@ -138,7 +139,7 @@ fun executeComplexFlow(client: HttpClient, router: McpRouter, city: String, thre
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
     System.setErr(PrintStream(System.err, true, "UTF-8"))
-    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(60)).build()
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(120)).build()
 
     val servers = listOf(
         McpServer("Погодный", "http://localhost:8081/mcp"),
@@ -173,12 +174,15 @@ fun main() {
 
     val scanner = Scanner(System.`in`, "UTF-8")
     println("\nКоманды:")
-    println("  complex <город> [порог] – выполнить длинный флоу (порог температуры по умолчанию 25°C)")
+    println("  complex <город> [порог]    – выполнить длинный флоу (порог температуры по умолчанию 25°C)")
     println("  index <путь> [max_tokens] [overlap] – проиндексировать .txt файлы в папке")
     println("  search <стратегия> <запрос> – поиск по индексу (fixed или structural)")
-    println("  compare <путь>          – сравнить две стратегии чанкинга")
-    println("  exit                    – выход")
-    println("  help                    – показать список инструментов по серверам")
+    println("  compare <путь>             – сравнить две стратегии чанкинга")
+    println("  ask <вопрос>               – задать вопрос LLM без контекста")
+    println("  rag [стратегия] <вопрос>   – задать вопрос с RAG (structural по умолчанию)")
+    println("  both [стратегия] <вопрос>  – задать вопрос и вывести оба ответа (ask + rag)")
+    println("  exit                       – выход")
+    println("  help                       – показать список инструментов по серверам")
 
     while (true) {
         print("> ")
@@ -215,7 +219,12 @@ fun main() {
                 } else {
                     val result = callMcpTool(client, server.url, "index_folder",
                         JSONObject().apply { put("path", path); put("max_tokens", maxTokens); put("overlap", overlap) })
-                    println(result)
+                    val json = JSONObject(result)
+                    if (json.has("error")) {
+                        println("Ошибка: ${json.opt("error")}")
+                    } else {
+                        println(result)
+                    }
                 }
             }
             input.startsWith("search ", true) -> {
@@ -232,24 +241,27 @@ fun main() {
                         val result = callMcpTool(client, server.url, "search",
                             JSONObject().apply { put("query", query); put("strategy", strategy) })
                         val json = JSONObject(result)
-                        val resultsArray = json.optJSONArray("results")
-                        if (resultsArray == null || resultsArray.length() == 0) {
-                            println("Ничего не найдено.")
+                        if (json.has("error")) {
+                            println("Ошибка: ${json.opt("error")}")
                         } else {
-                            println("\nРезультаты поиска по запросу \"$query\" (стратегия: $strategy):")
-                            println("─".repeat(60))
-                            for (i in 0 until resultsArray.length()) {
-                                val item = resultsArray.getJSONObject(i)
-                                val score = item.optDouble("score", 0.0)
-                                val text = item.optString("text", "").replace("\r\n", " ").replace("\n", " ")
-                                val chunkId = item.optString("chunk_id", "?")
-                                val metadata = item.optJSONObject("metadata")
-                                val source = metadata?.optString("source", "") ?: ""
-                                val section = metadata?.optString("section", "") ?: ""
-                                println("${i + 1}. [$chunkId] (score: ${"%.4f".format(score)})")
-                                if (section.isNotEmpty()) println("   Раздел: $section")
-                                println("   $text")
-                                println()
+                            val resultsArray = json.optJSONArray("results")
+                            if (resultsArray == null || resultsArray.length() == 0) {
+                                println("Ничего не найдено.")
+                            } else {
+                                println("\nРезультаты поиска по запросу \"$query\" (стратегия: $strategy):")
+                                println("─".repeat(60))
+                                for (i in 0 until resultsArray.length()) {
+                                    val item = resultsArray.getJSONObject(i)
+                                    val score = item.optDouble("score", 0.0)
+                                    val text = item.optString("text", "").replace("\r\n", " ").replace("\n", " ")
+                                    val chunkId = item.optString("chunk_id", "?")
+                                    val metadata = item.optJSONObject("metadata")
+                                    val section = metadata?.optString("section", "") ?: ""
+                                    println("${i + 1}. [$chunkId] (score: ${"%.4f".format(score)})")
+                                    if (section.isNotEmpty()) println("   Раздел: $section")
+                                    println("   $text")
+                                    println()
+                                }
                             }
                         }
                     }
@@ -265,7 +277,7 @@ fun main() {
                         JSONObject().apply { put("path", path) })
                     val json = JSONObject(result)
                     if (json.has("error")) {
-                        println("Ошибка: ${json.getString("error")}")
+                        println("Ошибка: ${json.opt("error")}")
                     } else {
                         println("\nСравнение стратегий чанкинга для папки \"$path\"")
                         println("=".repeat(60))
@@ -298,8 +310,160 @@ fun main() {
                     }
                 }
             }
+            input.startsWith("ask ", true) -> {
+                val question = input.removePrefix("ask ").trim()
+                val server = router.getServer("ask_llm")
+                if (server == null) println("❌ Инструмент ask_llm не найден.")
+                else {
+                    val raw = callMcpTool(client, server.url, "ask_llm", JSONObject().apply { put("question", question) })
+                    try {
+                        val json = JSONObject(raw)
+                        if (json.has("error")) {
+                            println("Ошибка: ${json.opt("error")}")
+                        } else {
+                            val result = json.getJSONObject("result")
+                            val contentArray = result.getJSONArray("content")
+                            val innerText = contentArray.getJSONObject(0).getString("text")
+                            val innerJson = JSONObject(innerText)
+                            if (innerJson.has("answer")) {
+                                println("\nОтвет LLM (без RAG):\n${innerJson.getString("answer")}")
+                            } else if (innerJson.has("error")) {
+                                println("Ошибка LLM: ${innerJson.opt("error")}")
+                            } else {
+                                println("Неожиданный формат ответа: $raw")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора ответа: ${e.message}")
+                        println("Сырой ответ: $raw")
+                    }
+                }
+            }
+            input.startsWith("rag ", true) -> {
+                val parts = input.removePrefix("rag ").trim().split(" ", limit = 2)
+                val question: String
+                val strategy: String?
+                if (parts.size == 2 && (parts[0] == "fixed" || parts[0] == "structural")) {
+                    strategy = parts[0]
+                    question = parts[1]
+                } else {
+                    strategy = null
+                    question = input.removePrefix("rag ").trim()
+                }
+                val server = router.getServer("rag_query")
+                if (server == null) {
+                    println("❌ Инструмент rag_query не найден.")
+                } else {
+                    fun tryRag(strat: String): String? {
+                        val raw = callMcpTool(client, server.url, "rag_query",
+                            JSONObject().apply {
+                                put("question", question)
+                                put("strategy", strat)
+                                put("top_k", 7)
+                            })
+                        val json = JSONObject(raw)
+                        if (json.has("error")) return null
+                        val result = json.getJSONObject("result")
+                        val contentArray = result.getJSONArray("content")
+                        val innerText = contentArray.getJSONObject(0).getString("text")
+                        val innerJson = JSONObject(innerText)
+                        val answer = innerJson.optString("answer", "")
+                        return if (answer.contains("Недостаточно информации") || answer.isBlank()) null else answer
+                    }
+
+                    var answer: String? = null
+                    if (strategy != null) {
+                        answer = tryRag(strategy)
+                    } else {
+                        answer = tryRag("structural") ?: tryRag("fixed")
+                    }
+                    if (answer != null) {
+                        println("\nОтвет RAG:\n$answer")
+                    } else {
+                        println("Недостаточно информации ни в одной из стратегий.")
+                    }
+                }
+            }
+            input.startsWith("both ", true) -> {
+                val parts = input.removePrefix("both ").trim().split(" ", limit = 2)
+                val question: String
+                val strategy: String?
+                if (parts.size == 2 && (parts[0] == "fixed" || parts[0] == "structural")) {
+                    strategy = parts[0]
+                    question = parts[1]
+                } else {
+                    strategy = null
+                    question = input.removePrefix("both ").trim()
+                }
+
+                // 1. Ask
+                val askServer = router.getServer("ask_llm")
+                if (askServer == null) {
+                    println("❌ Инструмент ask_llm не найден.")
+                } else {
+                    println("\n=== Ответ без RAG (ask) ===")
+                    val raw = callMcpTool(client, askServer.url, "ask_llm", JSONObject().apply { put("question", question) })
+                    try {
+                        val json = JSONObject(raw)
+                        if (json.has("error")) {
+                            println("Ошибка: ${json.opt("error")}")
+                        } else {
+                            val result = json.getJSONObject("result")
+                            val contentArray = result.getJSONArray("content")
+                            val innerText = contentArray.getJSONObject(0).getString("text")
+                            val innerJson = JSONObject(innerText)
+                            if (innerJson.has("answer")) {
+                                println(innerJson.getString("answer"))
+                            } else if (innerJson.has("error")) {
+                                println("Ошибка LLM: ${innerJson.opt("error")}")
+                            } else {
+                                println("Неожиданный формат ответа: $raw")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора ответа: ${e.message}")
+                    }
+                }
+
+                // 2. RAG
+                val ragServer = router.getServer("rag_query")
+                if (ragServer == null) {
+                    println("❌ Инструмент rag_query не найден.")
+                } else {
+                    println("\n=== Ответ с RAG ===")
+                    fun tryRag(strat: String): String? {
+                        val raw = callMcpTool(client, ragServer.url, "rag_query",
+                            JSONObject().apply {
+                                put("question", question)
+                                put("strategy", strat)
+                                put("top_k", 7)
+                            })
+                        val json = JSONObject(raw)
+                        if (json.has("error")) return null
+                        val result = json.getJSONObject("result")
+                        val contentArray = result.getJSONArray("content")
+                        val innerText = contentArray.getJSONObject(0).getString("text")
+                        val innerJson = JSONObject(innerText)
+                        val answer = innerJson.optString("answer", "")
+                        return if (answer.contains("Недостаточно информации") || answer.isBlank()) null else answer
+                    }
+
+                    var answer: String? = null
+                    if (strategy != null) {
+                        answer = tryRag(strategy)
+                    } else {
+                        answer = tryRag("structural") ?: tryRag("fixed")
+                    }
+                    if (answer != null) {
+                        println(answer)
+                    } else {
+                        println("Недостаточно информации ни в одной из стратегий.")
+                    }
+                }
+                println("\n=== Сравнение: ask даёт общий ответ, RAG — основанный на документах ===")
+            }
             input.isEmpty() -> continue
-            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare' или 'help'.")
+            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both' или 'help'.")
         }
     }
 }

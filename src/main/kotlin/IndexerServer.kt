@@ -17,12 +17,18 @@ fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
     System.setErr(PrintStream(System.err, true, "UTF-8"))
 
+    val apiKey = System.getenv("DEEPSEEK_API_KEY")
+    if (apiKey.isNullOrBlank()) {
+        println("Ошибка: переменная окружения DEEPSEEK_API_KEY не задана.")
+        return
+    }
+
     val server = HttpServer.create(InetSocketAddress(8084), 0)
     server.createContext("/mcp") { exchange ->
         if (exchange.requestMethod == "POST") {
             val body = exchange.requestBody.readAllBytes().toString(Charsets.UTF_8)
             val request = JSONObject(body)
-            val response = handleIndexerRequest(request)
+            val response = handleIndexerRequest(request, apiKey)
             val responseBytes = response.toString().toByteArray()
             exchange.responseHeaders.add("Content-Type", "application/json")
             exchange.sendResponseHeaders(200, responseBytes.size.toLong())
@@ -32,10 +38,10 @@ fun main() {
         }
     }
     server.start()
-    println("Сервер индексации (Ollama) запущен на http://localhost:8084/mcp")
+    println("Сервер индексации (Ollama + RAG) запущен на http://localhost:8084/mcp")
 }
 
-fun handleIndexerRequest(request: JSONObject): JSONObject {
+fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
     val method = request.getString("method")
     val id = request.opt("id")
 
@@ -103,6 +109,38 @@ fun handleIndexerRequest(request: JSONObject): JSONObject {
                             put("required", JSONArray().apply { put("path") })
                         })
                     })
+                    put(JSONObject().apply {
+                        put("name", "ask_llm")
+                        put("description", "Задаёт вопрос LLM без дополнительного контекста (чистый DeepSeek)")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("question", JSONObject().apply {
+                                    put("type", "string"); put("description", "Вопрос пользователя")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("question") })
+                        })
+                    })
+                    put(JSONObject().apply {
+                        put("name", "rag_query")
+                        put("description", "Ищет релевантные чанки в индексе и передаёт их как контекст LLM (RAG)")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("question", JSONObject().apply {
+                                    put("type", "string"); put("description", "Вопрос пользователя")
+                                })
+                                put("strategy", JSONObject().apply {
+                                    put("type", "string"); put("description", "fixed или structural (по умолчанию structural)")
+                                })
+                                put("top_k", JSONObject().apply {
+                                    put("type", "integer"); put("description", "Кол-во чанков для контекста (по умолчанию 5)")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("question") })
+                        })
+                    })
                 }
                 JSONObject().apply {
                     put("jsonrpc", "2.0"); put("id", id)
@@ -130,6 +168,38 @@ fun handleIndexerRequest(request: JSONObject): JSONObject {
                     "compare_strategies" -> {
                         val path = arguments.getString("path")
                         compareStrategies(path)
+                    }
+                    "ask_llm" -> {
+                        val question = arguments.getString("question")
+                        callLLM(question, apiKey)
+                    }
+                    "rag_query" -> {
+                        val question = arguments.getString("question")
+                        val strategy = arguments.optString("strategy", "structural")  // по умолчанию structural
+                        val topK = arguments.optInt("top_k", 5)
+                        // 1. поиск релевантных чанков
+                        val searchResult = searchIndex(question, strategy, topK)
+                        val resultsArray = searchResult.optJSONArray("results")
+                        val context = StringBuilder()
+                        if (resultsArray != null) {
+                            for (i in 0 until resultsArray.length()) {
+                                val item = resultsArray.getJSONObject(i)
+                                val text = item.optString("text", "")
+                                context.append(text).append("\n\n")
+                            }
+                        }
+                        // 2. генерация ответа с контекстом
+                        val prompt = """
+                            Ты — ассистент, который использует базу знаний об отелях Причерноморья.
+                            Ответь на вопрос пользователя, опираясь **только** на приведённый ниже контекст.
+                            Если ответа нет в контексте, скажи: "Недостаточно информации".
+                            Контекст:
+                            $context
+                            
+                            Вопрос: $question
+                            Ответ:
+                        """.trimIndent()
+                        callLLM(prompt, apiKey)
                     }
                     else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
                 }
@@ -227,7 +297,7 @@ fun getEmbedding(text: String): List<Double> {
     val request = HttpRequest.newBuilder()
         .uri(URI.create("http://localhost:11434/api/embeddings"))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(60))
+        .timeout(Duration.ofSeconds(120))
         .POST(HttpRequest.BodyPublishers.ofString(body))
         .build()
     val response = client.send(request, HttpResponse.BodyHandlers.ofString())
@@ -387,4 +457,32 @@ fun compareStrategies(path: String): JSONObject {
         put("fixed_sample_boundaries", fixed.take(3).map { it.text.take(80) + "..." })
         put("structural_sample_boundaries", structural.take(3).map { "${it.metadata["section"]}: ${it.text.take(60)}..." })
     }
+}
+
+// ---------- LLM (DeepSeek Chat) ----------
+
+fun callLLM(prompt: String, apiKey: String): JSONObject {
+    val body = JSONObject().apply {
+        put("model", "deepseek-chat")
+        put("messages", JSONArray().apply {
+            put(JSONObject().apply { put("role", "user"); put("content", prompt) })
+        })
+        put("temperature", 0.0)
+        put("max_tokens", 500)
+    }.toString()
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer $apiKey")
+        .timeout(Duration.ofSeconds(120))
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+    val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() != 200) {
+        return JSONObject().apply { put("error", "LLM API error ${response.statusCode()}") }
+    }
+    val json = JSONObject(response.body())
+    val answer = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+    return JSONObject().apply { put("answer", answer) }
 }
