@@ -25,7 +25,7 @@ fun callMcpTool(client: HttpClient, serverUrl: String, toolName: String, argumen
     val httpRequest = HttpRequest.newBuilder()
         .uri(URI.create(serverUrl))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(30))
+        .timeout(Duration.ofSeconds(60))
         .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
         .build()
     val response = client.send(httpRequest, HttpResponse.BodyHandlers.ofString())
@@ -47,7 +47,7 @@ fun fetchTools(client: HttpClient, serverUrl: String): List<String> {
         val initRequest = HttpRequest.newBuilder()
             .uri(URI.create(serverUrl))
             .header("Content-Type", "application/json")
-            .timeout(Duration.ofSeconds(10))
+            .timeout(Duration.ofSeconds(30))
             .POST(HttpRequest.BodyPublishers.ofString(initBody.toString()))
             .build()
         client.send(initRequest, HttpResponse.BodyHandlers.ofString())
@@ -138,12 +138,13 @@ fun executeComplexFlow(client: HttpClient, router: McpRouter, city: String, thre
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
     System.setErr(PrintStream(System.err, true, "UTF-8"))
-    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(60)).build()
 
     val servers = listOf(
         McpServer("Погодный", "http://localhost:8081/mcp"),
         McpServer("Пайплайн", "http://localhost:8082/mcp"),
-        McpServer("Файловый", "http://localhost:8083/mcp")
+        McpServer("Файловый", "http://localhost:8083/mcp"),
+        McpServer("Индексатор", "http://localhost:8084/mcp")
     )
 
     println("Обнаружение MCP-серверов...")
@@ -165,7 +166,7 @@ fun main() {
     val router = McpRouter(servers)
     val allTools = router.allTools()
     if (allTools.isEmpty()) {
-        println("\n❌ Ни одного инструмента не обнаружено. Проверьте, что серверы запущены на портах 8081, 8082 и 8083.")
+        println("\n❌ Ни одного инструмента не обнаружено. Проверьте, что серверы запущены на портах 8081, 8082, 8083 и 8084.")
     } else {
         println("\n✅ Всего доступно инструментов: ${allTools.size} → ${allTools.joinToString(", ")}")
     }
@@ -173,8 +174,11 @@ fun main() {
     val scanner = Scanner(System.`in`, "UTF-8")
     println("\nКоманды:")
     println("  complex <город> [порог] – выполнить длинный флоу (порог температуры по умолчанию 25°C)")
-    println("  exit                     – выход")
-    println("  help                     – показать список инструментов по серверам")
+    println("  index <путь> [max_tokens] [overlap] – проиндексировать .txt файлы в папке")
+    println("  search <стратегия> <запрос> – поиск по индексу (fixed или structural)")
+    println("  compare <путь>          – сравнить две стратегии чанкинга")
+    println("  exit                    – выход")
+    println("  help                    – показать список инструментов по серверам")
 
     while (true) {
         print("> ")
@@ -196,8 +200,106 @@ fun main() {
                     executeComplexFlow(client, router, city, threshold)
                 }
             }
+            input.startsWith("index ", true) -> {
+                val parts = input.removePrefix("index ").trim().split(" ")
+                if (parts.isEmpty()) {
+                    println("Укажите путь к папке: index <путь> [max_tokens] [overlap]")
+                    continue
+                }
+                val path = parts[0]
+                val maxTokens = parts.getOrNull(1)?.toIntOrNull() ?: 500
+                val overlap = parts.getOrNull(2)?.toIntOrNull() ?: 50
+                val server = router.getServer("index_folder")
+                if (server == null) {
+                    println("❌ Инструмент index_folder не найден.")
+                } else {
+                    val result = callMcpTool(client, server.url, "index_folder",
+                        JSONObject().apply { put("path", path); put("max_tokens", maxTokens); put("overlap", overlap) })
+                    println(result)
+                }
+            }
+            input.startsWith("search ", true) -> {
+                val parts = input.removePrefix("search ").trim().split(" ", limit = 2)
+                if (parts.size < 2) {
+                    println("Формат: search <fixed|structural> <запрос>")
+                } else {
+                    val strategy = parts[0]
+                    val query = parts[1]
+                    val server = router.getServer("search")
+                    if (server == null) {
+                        println("❌ Инструмент search не найден.")
+                    } else {
+                        val result = callMcpTool(client, server.url, "search",
+                            JSONObject().apply { put("query", query); put("strategy", strategy) })
+                        val json = JSONObject(result)
+                        val resultsArray = json.optJSONArray("results")
+                        if (resultsArray == null || resultsArray.length() == 0) {
+                            println("Ничего не найдено.")
+                        } else {
+                            println("\nРезультаты поиска по запросу \"$query\" (стратегия: $strategy):")
+                            println("─".repeat(60))
+                            for (i in 0 until resultsArray.length()) {
+                                val item = resultsArray.getJSONObject(i)
+                                val score = item.optDouble("score", 0.0)
+                                val text = item.optString("text", "").replace("\r\n", " ").replace("\n", " ")
+                                val chunkId = item.optString("chunk_id", "?")
+                                val metadata = item.optJSONObject("metadata")
+                                val source = metadata?.optString("source", "") ?: ""
+                                val section = metadata?.optString("section", "") ?: ""
+                                println("${i + 1}. [$chunkId] (score: ${"%.4f".format(score)})")
+                                if (section.isNotEmpty()) println("   Раздел: $section")
+                                println("   $text")
+                                println()
+                            }
+                        }
+                    }
+                }
+            }
+            input.startsWith("compare ", true) -> {
+                val path = input.removePrefix("compare ").trim()
+                val server = router.getServer("compare_strategies")
+                if (server == null) {
+                    println("❌ Инструмент compare_strategies не найден.")
+                } else {
+                    val result = callMcpTool(client, server.url, "compare_strategies",
+                        JSONObject().apply { put("path", path) })
+                    val json = JSONObject(result)
+                    if (json.has("error")) {
+                        println("Ошибка: ${json.getString("error")}")
+                    } else {
+                        println("\nСравнение стратегий чанкинга для папки \"$path\"")
+                        println("=".repeat(60))
+                        println("▶ Фиксированная (Fixed)")
+                        println("   Чанков: ${json.optInt("fixed_chunks", 0)}")
+                        println("   Средний размер (слов): ${"%.1f".format(json.optDouble("fixed_avg_words", 0.0))}")
+                        println("   Мин./Макс. размер (слов): ${json.optInt("fixed_min_words", 0)} / ${json.optInt("fixed_max_words", 0)}")
+                        println()
+                        println("▶ Структурная (Structural)")
+                        println("   Чанков: ${json.optInt("structural_chunks", 0)}")
+                        println("   Средний размер (слов): ${"%.1f".format(json.optDouble("structural_avg_words", 0.0))}")
+                        println("   Мин./Макс. размер (слов): ${json.optInt("structural_min_words", 0)} / ${json.optInt("structural_max_words", 0)}")
+                        println()
+                        val fixedSamples = json.optJSONArray("fixed_sample_boundaries")
+                        val structSamples = json.optJSONArray("structural_sample_boundaries")
+                        if (fixedSamples != null && fixedSamples.length() > 0) {
+                            println("▶ Примеры границ чанков (Fixed):")
+                            for (i in 0 until fixedSamples.length()) {
+                                println("   ${fixedSamples.getString(i)}")
+                            }
+                            println()
+                        }
+                        if (structSamples != null && structSamples.length() > 0) {
+                            println("▶ Примеры границ чанков (Structural):")
+                            for (i in 0 until structSamples.length()) {
+                                println("   ${structSamples.getString(i)}")
+                            }
+                            println()
+                        }
+                    }
+                }
+            }
             input.isEmpty() -> continue
-            else -> println("Неизвестная команда. Используйте 'complex <город>' или 'help'.")
+            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare' или 'help'.")
         }
     }
 }
