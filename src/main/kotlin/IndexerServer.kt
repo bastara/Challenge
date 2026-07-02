@@ -38,7 +38,7 @@ fun main() {
         }
     }
     server.start()
-    println("Сервер индексации (Ollama + RAG) запущен на http://localhost:8084/mcp")
+    println("Сервер индексации (Ollama + RAG + фильтрация + rewrite) запущен на http://localhost:8084/mcp")
 }
 
 fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
@@ -52,7 +52,7 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                 put("result", JSONObject().apply {
                     put("capabilities", JSONObject())
                     put("serverInfo", JSONObject().apply {
-                        put("name", "indexer-server"); put("version", "2.0.0")
+                        put("name", "indexer-server"); put("version", "3.0.0")
                     })
                 })
             }
@@ -124,7 +124,7 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                     })
                     put(JSONObject().apply {
                         put("name", "rag_query")
-                        put("description", "Ищет релевантные чанки в индексе и передаёт их как контекст LLM (RAG)")
+                        put("description", "Ищет релевантные чанки, фильтрует, опционально переписывает запрос и передаёт контекст LLM")
                         put("parameters", JSONObject().apply {
                             put("type", "object")
                             put("properties", JSONObject().apply {
@@ -136,6 +136,12 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                                 })
                                 put("top_k", JSONObject().apply {
                                     put("type", "integer"); put("description", "Кол-во чанков для контекста (по умолчанию 5)")
+                                })
+                                put("min_score", JSONObject().apply {
+                                    put("type", "number"); put("description", "Порог косинусного сходства (0.0 = без фильтра)")
+                                })
+                                put("use_rewrite", JSONObject().apply {
+                                    put("type", "boolean"); put("description", "Переформулировать ли запрос перед поиском")
                                 })
                             })
                             put("required", JSONArray().apply { put("question") })
@@ -174,21 +180,33 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                         callLLM(question, apiKey)
                     }
                     "rag_query" -> {
-                        val question = arguments.getString("question")
-                        val strategy = arguments.optString("strategy", "structural")  // по умолчанию structural
+                        val originalQuestion = arguments.getString("question")
+                        val strategy = arguments.optString("strategy", "structural")
                         val topK = arguments.optInt("top_k", 5)
-                        // 1. поиск релевантных чанков
-                        val searchResult = searchIndex(question, strategy, topK)
+                        val minScore = arguments.optDouble("min_score", 0.0)
+                        val useRewrite = arguments.optBoolean("use_rewrite", false)
+
+                        val questionToUse = if (useRewrite) {
+                            rewriteQuery(originalQuestion, apiKey)
+                        } else {
+                            originalQuestion
+                        }
+
+                        val searchResult = searchIndex(questionToUse, strategy, topK)
                         val resultsArray = searchResult.optJSONArray("results")
                         val context = StringBuilder()
+                        var filteredCount = 0
                         if (resultsArray != null) {
                             for (i in 0 until resultsArray.length()) {
                                 val item = resultsArray.getJSONObject(i)
+                                val score = item.optDouble("score", 0.0)
+                                if (minScore > 0.0 && score < minScore) continue
+                                filteredCount++
                                 val text = item.optString("text", "")
                                 context.append(text).append("\n\n")
                             }
                         }
-                        // 2. генерация ответа с контекстом
+
                         val prompt = """
                             Ты — ассистент, который использует базу знаний об отелях Причерноморья.
                             Ответь на вопрос пользователя, опираясь **только** на приведённый ниже контекст.
@@ -196,10 +214,16 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                             Контекст:
                             $context
                             
-                            Вопрос: $question
+                            Вопрос: $originalQuestion
                             Ответ:
                         """.trimIndent()
-                        callLLM(prompt, apiKey)
+                        val llmResponse = callLLM(prompt, apiKey)
+                        llmResponse.put("original_top_k", resultsArray?.length() ?: 0)
+                        llmResponse.put("filtered_count", filteredCount)
+                        if (useRewrite) {
+                            llmResponse.put("rewritten_query", questionToUse)
+                        }
+                        llmResponse
                     }
                     else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
                 }
@@ -238,7 +262,7 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
 // ---------- Chunking ----------
 
 fun chunkFixed(text: String, maxTokens: Int = 500, overlap: Int = 50): List<String> {
-    val maxChars = 1000   // гарантированно меньше лимита модели
+    val maxChars = 1000
     val overlapChars = 200
     val chunks = mutableListOf<String>()
     var start = 0
@@ -297,7 +321,7 @@ fun getEmbedding(text: String): List<Double> {
     val request = HttpRequest.newBuilder()
         .uri(URI.create("http://localhost:11434/api/embeddings"))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(120))
+        .timeout(Duration.ofSeconds(60))
         .POST(HttpRequest.BodyPublishers.ofString(body))
         .build()
     val response = client.send(request, HttpResponse.BodyHandlers.ofString())
@@ -379,7 +403,6 @@ fun indexFolder(path: String, maxTokens: Int, overlap: Int): JSONObject {
 
     val allText = txtFiles.joinToString("\n\n") { it.readText() }
 
-    // Fixed strategy
     val fixedChunks = chunkFixed(allText, maxTokens, overlap)
     val fixedEntries = mutableListOf<ChunkEntry>()
     for ((i, chunk) in fixedChunks.withIndex()) {
@@ -393,7 +416,6 @@ fun indexFolder(path: String, maxTokens: Int, overlap: Int): JSONObject {
     }
     saveIndex("fixed", fixedEntries)
 
-    // Structural strategy
     val structuralSections = mutableListOf<Pair<String, String>>()
     for (file in txtFiles) {
         structuralSections.addAll(chunkStructural(file.readText(), file.name))
@@ -459,6 +481,42 @@ fun compareStrategies(path: String): JSONObject {
     }
 }
 
+// ---------- Query Rewrite ----------
+
+fun rewriteQuery(original: String, apiKey: String): String {
+    val prompt = """
+        Перепиши следующий вопрос так, чтобы он стал более эффективным для поиска по документам, сохранив исходный смысл.
+        Верни только переписанный вопрос, без кавычек и дополнительных комментариев.
+        Вопрос: $original
+    """.trimIndent()
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+    val body = JSONObject().apply {
+        put("model", "deepseek-chat")
+        put("messages", JSONArray().apply {
+            put(JSONObject().apply { put("role", "user"); put("content", prompt) })
+        })
+        put("temperature", 0.0)
+        put("max_tokens", 200)
+    }.toString()
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer $apiKey")
+        .timeout(Duration.ofSeconds(30))
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+    val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() == 200) {
+        val json = JSONObject(response.body())
+        val rewritten = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content").trim()
+        println("Переформулированный запрос: $rewritten")
+        return rewritten
+    } else {
+        println("Ошибка rewrite API: ${response.statusCode()}, используется оригинальный запрос")
+        return original
+    }
+}
+
 // ---------- LLM (DeepSeek Chat) ----------
 
 fun callLLM(prompt: String, apiKey: String): JSONObject {
@@ -475,7 +533,7 @@ fun callLLM(prompt: String, apiKey: String): JSONObject {
         .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
         .header("Content-Type", "application/json")
         .header("Authorization", "Bearer $apiKey")
-        .timeout(Duration.ofSeconds(120))
+        .timeout(Duration.ofSeconds(30))
         .POST(HttpRequest.BodyPublishers.ofString(body))
         .build()
     val response = client.send(request, HttpResponse.BodyHandlers.ofString())
