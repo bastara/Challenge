@@ -415,7 +415,7 @@ fun main() {
                         val innerText = contentArray.getJSONObject(0).getString("text")
                         val innerJson = JSONObject(innerText)
                         val answer = innerJson.optString("answer", "")
-                        if (answer.contains("Недостаточно информации") || answer.isBlank()) return null
+                        if (answer.contains("Не знаю") || answer.isBlank()) return innerJson  // возвращаем даже "не знаю"
                         return innerJson
                     }
 
@@ -429,6 +429,15 @@ fun main() {
                     if (innerJson != null) {
                         val answer = innerJson.getString("answer")
                         println(answer)
+                        val sources = innerJson.optJSONArray("sources")
+                        if (sources != null && sources.length() > 0) {
+                            println("\nИсточники:")
+                            for (i in 0 until sources.length()) {
+                                val src = sources.getJSONObject(i)
+                                println("  [${i + 1}] Section: ${src.getString("section")}, Chunk: ${src.getString("chunk_id")}, Score: ${"%.3f".format(src.getDouble("score"))}")
+                                println("      Preview: ${src.getString("text_preview").take(100)}...")
+                            }
+                        }
                         val originalTopK = innerJson.optInt("original_top_k", -1)
                         val filteredCount = innerJson.optInt("filtered_count", -1)
                         if (originalTopK >= 0) {
@@ -444,7 +453,7 @@ fun main() {
                     }
                 }
                 if (isBoth) {
-                    println("\n=== Сравнение: ask даёт общий ответ, RAG — основанный на документах (с фильтрацией) ===")
+                    println("\n=== Сравнение: ask даёт общий ответ, RAG — основанный на документах (с цитированием) ===")
                 }
             }
             input.isEmpty() -> continue

@@ -11,7 +11,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import kotlin.math.sqrt
 
-private const val EMBEDDING_DIM = 768   // nomic-embed-text
+private const val EMBEDDING_DIM = 768
 
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
@@ -38,7 +38,7 @@ fun main() {
         }
     }
     server.start()
-    println("Сервер индексации (Ollama + RAG + фильтрация + rewrite) запущен на http://localhost:8084/mcp")
+    println("Сервер индексации (Ollama + RAG + цитирование + режим не знаю) запущен на http://localhost:8084/mcp")
 }
 
 fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
@@ -52,7 +52,7 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                 put("result", JSONObject().apply {
                     put("capabilities", JSONObject())
                     put("serverInfo", JSONObject().apply {
-                        put("name", "indexer-server"); put("version", "3.0.0")
+                        put("name", "indexer-server"); put("version", "4.0.0")
                     })
                 })
             }
@@ -124,7 +124,7 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                     })
                     put(JSONObject().apply {
                         put("name", "rag_query")
-                        put("description", "Ищет релевантные чанки, фильтрует, опционально переписывает запрос и передаёт контекст LLM")
+                        put("description", "Ищет релевантные чанки, фильтрует, опционально переписывает запрос и передаёт контекст LLM с требованием цитирования и источников")
                         put("parameters", JSONObject().apply {
                             put("type", "object")
                             put("properties", JSONObject().apply {
@@ -186,16 +186,14 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                         val minScore = arguments.optDouble("min_score", 0.0)
                         val useRewrite = arguments.optBoolean("use_rewrite", false)
 
-                        val questionToUse = if (useRewrite) {
-                            rewriteQuery(originalQuestion, apiKey)
-                        } else {
-                            originalQuestion
-                        }
+                        val questionToUse = if (useRewrite) rewriteQuery(originalQuestion, apiKey) else originalQuestion
 
                         val searchResult = searchIndex(questionToUse, strategy, topK)
                         val resultsArray = searchResult.optJSONArray("results")
-                        val context = StringBuilder()
+                        val contextBuilder = StringBuilder()
+                        val sources = JSONArray()
                         var filteredCount = 0
+                        var hasRelevant = false
                         if (resultsArray != null) {
                             for (i in 0 until resultsArray.length()) {
                                 val item = resultsArray.getJSONObject(i)
@@ -203,27 +201,51 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                                 if (minScore > 0.0 && score < minScore) continue
                                 filteredCount++
                                 val text = item.optString("text", "")
-                                context.append(text).append("\n\n")
+                                val metadata = item.optJSONObject("metadata")
+                                val section = metadata?.optString("section", "?") ?: "?"
+                                val chunkId = item.optString("chunk_id", "?")
+                                contextBuilder.append("Source [${filteredCount}] (section: $section, chunk: $chunkId, score: ${"%.3f".format(score)}):\n$text\n\n")
+                                sources.put(JSONObject().apply {
+                                    put("section", section)
+                                    put("chunk_id", chunkId)
+                                    put("score", score)
+                                    put("text_preview", text.take(200))
+                                })
+                                hasRelevant = true
                             }
                         }
 
-                        val prompt = """
-                            Ты — ассистент, который использует базу знаний об отелях Причерноморья.
-                            Ответь на вопрос пользователя, опираясь **только** на приведённый ниже контекст.
-                            Если ответа нет в контексте, скажи: "Недостаточно информации".
-                            Контекст:
-                            $context
-                            
-                            Вопрос: $originalQuestion
-                            Ответ:
-                        """.trimIndent()
-                        val llmResponse = callLLM(prompt, apiKey)
-                        llmResponse.put("original_top_k", resultsArray?.length() ?: 0)
-                        llmResponse.put("filtered_count", filteredCount)
-                        if (useRewrite) {
-                            llmResponse.put("rewritten_query", questionToUse)
+                        val answer: JSONObject
+                        if (!hasRelevant) {
+                            answer = JSONObject().apply {
+                                put("answer", "Не знаю. Недостаточно релевантного контекста для ответа.")
+                                put("sources", JSONArray())
+                                put("status", "no_context")
+                            }
+                        } else {
+                            val prompt = """
+                                Ты — ассистент, который использует базу знаний об отелях Причерноморья.
+                                Ответь на вопрос пользователя, опираясь **только** на приведённый ниже контекст.
+                                Твой ответ **обязательно** должен содержать:
+                                1. Краткий ответ (2-3 предложения).
+                                2. Цитаты из контекста (фрагменты текста с указанием номера источника в формате [1]).
+                                3. Список использованных источников в конце (секция + чанк).
+                                Если контекст не содержит ответа, скажи: "Не знаю. В документах недостаточно информации".
+                                Контекст:
+                                $contextBuilder
+                                
+                                Вопрос: $originalQuestion
+                                Ответ:
+                            """.trimIndent()
+                            val llmResponse = callLLM(prompt, apiKey)
+                            llmResponse.put("sources", sources)
+                            llmResponse.put("status", "ok")
+                            answer = llmResponse
                         }
-                        llmResponse
+                        answer.put("original_top_k", resultsArray?.length() ?: 0)
+                        answer.put("filtered_count", filteredCount)
+                        if (useRewrite) answer.put("rewritten_query", questionToUse)
+                        answer
                     }
                     else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
                 }
@@ -526,7 +548,7 @@ fun callLLM(prompt: String, apiKey: String): JSONObject {
             put(JSONObject().apply { put("role", "user"); put("content", prompt) })
         })
         put("temperature", 0.0)
-        put("max_tokens", 500)
+        put("max_tokens", 600)
     }.toString()
     val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
     val request = HttpRequest.newBuilder()
