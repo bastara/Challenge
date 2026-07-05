@@ -177,6 +177,9 @@ fun main() {
     println("  ask <вопрос>               – задать вопрос LLM без контекста")
     println("  rag [min_score=X] [rewrite] [стратегия] <вопрос> – задать вопрос с RAG")
     println("  both [min_score=X] [rewrite] [стратегия] <вопрос> – ask + rag одновременно")
+    println("  chat <session_id> [goal]   – начать/продолжить RAG-чат с памятью задачи")
+    println("  task <session_id>          – показать память задачи")
+    println("  stop <session_id>          – завершить сессию чата")
     println("  exit                       – выход")
     println("  help                       – показать список инструментов по серверам")
 
@@ -415,7 +418,7 @@ fun main() {
                         val innerText = contentArray.getJSONObject(0).getString("text")
                         val innerJson = JSONObject(innerText)
                         val answer = innerJson.optString("answer", "")
-                        if (answer.contains("Не знаю") || answer.isBlank()) return innerJson  // возвращаем даже "не знаю"
+                        if (answer.contains("Не знаю") || answer.isBlank()) return innerJson
                         return innerJson
                     }
 
@@ -456,8 +459,131 @@ fun main() {
                     println("\n=== Сравнение: ask даёт общий ответ, RAG — основанный на документах (с цитированием) ===")
                 }
             }
+            input.startsWith("chat ", true) -> {
+                val parts = input.removePrefix("chat ").trim().split(" ", limit = 2)
+                if (parts.isEmpty()) {
+                    println("Используйте: chat <session_id> [goal]")
+                    continue
+                }
+                val sessionId = parts[0]
+                val goal = if (parts.size > 1) parts[1] else ""
+                val indexerUrl = "http://localhost:8084/mcp"
+
+                // Инициализация сессии
+                if (goal.isNotEmpty()) {
+                    val startResp = callMcpTool(client, indexerUrl, "start_chat",
+                        JSONObject().apply { put("session_id", sessionId); put("goal", goal) })
+                    println("Сессия '$sessionId' создана. Цель: $goal")
+                }
+
+                println("Чат с RAG (session: $sessionId). Введите 'exit chat' для выхода, 'task' для просмотра памяти.")
+                while (true) {
+                    print("[${sessionId}] > ")
+                    val msg = scanner.nextLine().trim()
+                    if (msg.equals("exit chat", true)) break
+                    if (msg.equals("task", true)) {
+                        val taskJson = callMcpTool(client, indexerUrl, "get_task_state",
+                            JSONObject().apply { put("session_id", sessionId) })
+                        try {
+                            val json = JSONObject(taskJson)
+                            if (json.has("error")) {
+                                println("Ошибка: ${json.opt("error")}")
+                            } else {
+                                val result = json.getJSONObject("result")
+                                val contentArray = result.getJSONArray("content")
+                                val innerText = contentArray.getJSONObject(0).getString("text")
+                                val innerJson = JSONObject(innerText)
+                                println("\nПамять задачи:")
+                                println("  Цель: ${innerJson.optString("goal", "не задана")}")
+                                val constraints = innerJson.optJSONArray("constraints")
+                                if (constraints != null && constraints.length() > 0) {
+                                    println("  Ограничения: ${(0 until constraints.length()).joinToString(", ") { constraints.getString(it) }}")
+                                }
+                                val terms = innerJson.optJSONArray("terms")
+                                if (terms != null && terms.length() > 0) {
+                                    println("  Термины/факты: ${(0 until terms.length()).joinToString(", ") { terms.getString(it) }}")
+                                }
+                                val notes = innerJson.optJSONArray("notes")
+                                if (notes != null && notes.length() > 0) {
+                                    println("  Заметки: ${(0 until notes.length()).joinToString(", ") { notes.getString(it) }}")
+                                }
+                            }
+                        } catch (e: Exception) {
+                            println("Ошибка разбора памяти: ${e.message}")
+                        }
+                        continue
+                    }
+                    if (msg.isEmpty()) continue
+
+                    val raw = callMcpTool(client, indexerUrl, "chat_with_rag",
+                        JSONObject().apply { put("session_id", sessionId); put("message", msg) })
+                    try {
+                        val json = JSONObject(raw)
+                        if (json.has("error")) {
+                            println("Ошибка: ${json.opt("error")}")
+                        } else {
+                            val result = json.getJSONObject("result")
+                            val contentArray = result.getJSONArray("content")
+                            val innerText = contentArray.getJSONObject(0).getString("text")
+                            val innerJson = JSONObject(innerText)
+
+                            val answer = innerJson.optString("answer", "Ошибка: ответ не получен")
+                            println("Ассистент: $answer")
+                            val sources = innerJson.optJSONArray("sources")
+                            if (sources != null && sources.length() > 0) {
+                                println("\nИсточники:")
+                                for (i in 0 until sources.length()) {
+                                    val src = sources.getJSONObject(i)
+                                    println("  [${i + 1}] Section: ${src.getString("section")}, Chunk: ${src.getString("chunk_id")}, Score: ${"%.3f".format(src.getDouble("score"))}")
+                                    println("      Preview: ${src.optString("text_preview", "").take(100)}...")
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора ответа: ${e.message}")
+                        println("Сырой ответ: $raw")
+                    }
+                }
+            }
+            input.startsWith("task ", true) -> {
+                val sessionId = input.removePrefix("task ").trim()
+                val indexerUrl = "http://localhost:8084/mcp"
+                val taskJson = callMcpTool(client, indexerUrl, "get_task_state",
+                    JSONObject().apply { put("session_id", sessionId) })
+                try {
+                    val json = JSONObject(taskJson)
+                    if (json.has("error")) {
+                        println("Ошибка: ${json.opt("error")}")
+                    } else {
+                        val result = json.getJSONObject("result")
+                        val contentArray = result.getJSONArray("content")
+                        val innerText = contentArray.getJSONObject(0).getString("text")
+                        val innerJson = JSONObject(innerText)
+                        println("\nПамять задачи для сессии '$sessionId':")
+                        println("  Цель: ${innerJson.optString("goal", "не задана")}")
+                        val constraints = innerJson.optJSONArray("constraints")
+                        if (constraints != null && constraints.length() > 0) {
+                            println("  Ограничения: ${(0 until constraints.length()).joinToString(", ") { constraints.getString(it) }}")
+                        }
+                        val terms = innerJson.optJSONArray("terms")
+                        if (terms != null && terms.length() > 0) {
+                            println("  Термины/факты: ${(0 until terms.length()).joinToString(", ") { terms.getString(it) }}")
+                        }
+                        val notes = innerJson.optJSONArray("notes")
+                        if (notes != null && notes.length() > 0) {
+                            println("  Заметки: ${(0 until notes.length()).joinToString(", ") { notes.getString(it) }}")
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("Ошибка разбора памяти: ${e.message}")
+                }
+            }
+            input.startsWith("stop ", true) -> {
+                val sessionId = input.removePrefix("stop ").trim()
+                println("Сессия '$sessionId' завершена (память задачи сохранена в памяти сервера до перезапуска).")
+            }
             input.isEmpty() -> continue
-            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both' или 'help'.")
+            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both', 'chat', 'task' или 'help'.")
         }
     }
 }

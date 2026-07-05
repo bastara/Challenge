@@ -11,7 +11,34 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import kotlin.math.sqrt
 
+// ---------- Состояние задачи (память) ----------
+data class TaskMemory(
+    var goal: String = "",
+    val constraints: MutableList<String> = mutableListOf(),
+    val terms: MutableList<String> = mutableListOf(),
+    val notes: MutableList<String> = mutableListOf()
+) {
+    fun toPrompt(): String {
+        if (goal.isEmpty() && constraints.isEmpty() && terms.isEmpty() && notes.isEmpty()) return ""
+        val sb = StringBuilder("Текущая память задачи:\n")
+        if (goal.isNotEmpty()) sb.appendLine("- Цель: $goal")
+        if (constraints.isNotEmpty()) sb.appendLine("- Ограничения: ${constraints.joinToString(", ")}")
+        if (terms.isNotEmpty()) sb.appendLine("- Термины/факты: ${terms.joinToString(", ")}")
+        if (notes.isNotEmpty()) sb.appendLine("- Заметки: ${notes.joinToString(", ")}")
+        return sb.toString()
+    }
+}
+
+// ---------- Основной сервер ----------
 private const val EMBEDDING_DIM = 768
+
+// Хранилище сессий чата (в памяти)
+private val chatSessions = mutableMapOf<String, ChatSession>()
+
+data class ChatSession(
+    val history: MutableList<Map<String, String>> = mutableListOf(),
+    val taskMemory: TaskMemory = TaskMemory()
+)
 
 fun main() {
     System.setOut(PrintStream(System.out, true, "UTF-8"))
@@ -38,7 +65,7 @@ fun main() {
         }
     }
     server.start()
-    println("Сервер индексации (Ollama + RAG + цитирование + режим не знаю) запущен на http://localhost:8084/mcp")
+    println("Сервер индексации (чат с RAG + память задачи) запущен на http://localhost:8084/mcp")
 }
 
 fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
@@ -52,7 +79,7 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                 put("result", JSONObject().apply {
                     put("capabilities", JSONObject())
                     put("serverInfo", JSONObject().apply {
-                        put("name", "indexer-server"); put("version", "4.0.0")
+                        put("name", "chat-rag-server"); put("version", "5.0.0")
                     })
                 })
             }
@@ -147,6 +174,51 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                             put("required", JSONArray().apply { put("question") })
                         })
                     })
+                    put(JSONObject().apply {
+                        put("name", "start_chat")
+                        put("description", "Начинает новую сессию чата с RAG")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("session_id", JSONObject().apply {
+                                    put("type", "string"); put("description", "Идентификатор сессии (любая строка)")
+                                })
+                                put("goal", JSONObject().apply {
+                                    put("type", "string"); put("description", "Цель диалога (опционально)")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("session_id") })
+                        })
+                    })
+                    put(JSONObject().apply {
+                        put("name", "chat_with_rag")
+                        put("description", "Отправляет сообщение в RAG-чат с историей и памятью задачи")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("session_id", JSONObject().apply {
+                                    put("type", "string"); put("description", "Идентификатор сессии")
+                                })
+                                put("message", JSONObject().apply {
+                                    put("type", "string"); put("description", "Сообщение пользователя")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("session_id"); put("message") })
+                        })
+                    })
+                    put(JSONObject().apply {
+                        put("name", "get_task_state")
+                        put("description", "Возвращает текущее состояние памяти задачи для сессии")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("session_id", JSONObject().apply {
+                                    put("type", "string"); put("description", "Идентификатор сессии")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("session_id") })
+                        })
+                    })
                 }
                 JSONObject().apply {
                     put("jsonrpc", "2.0"); put("id", id)
@@ -215,9 +287,9 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                             }
                         }
 
-                        val answer: JSONObject
+                        val answerJson: JSONObject
                         if (!hasRelevant) {
-                            answer = JSONObject().apply {
+                            answerJson = JSONObject().apply {
                                 put("answer", "Не знаю. Недостаточно релевантного контекста для ответа.")
                                 put("sources", JSONArray())
                                 put("status", "no_context")
@@ -240,12 +312,127 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                             val llmResponse = callLLM(prompt, apiKey)
                             llmResponse.put("sources", sources)
                             llmResponse.put("status", "ok")
-                            answer = llmResponse
+                            answerJson = llmResponse
                         }
-                        answer.put("original_top_k", resultsArray?.length() ?: 0)
-                        answer.put("filtered_count", filteredCount)
-                        if (useRewrite) answer.put("rewritten_query", questionToUse)
-                        answer
+                        answerJson.put("original_top_k", resultsArray?.length() ?: 0)
+                        answerJson.put("filtered_count", filteredCount)
+                        if (useRewrite) answerJson.put("rewritten_query", questionToUse)
+                        answerJson
+                    }
+                    "start_chat" -> {
+                        val sessionId = arguments.getString("session_id")
+                        val goal = arguments.optString("goal", "")
+                        val session = ChatSession()
+                        if (goal.isNotEmpty()) session.taskMemory.goal = goal
+                        chatSessions[sessionId] = session
+                        JSONObject().apply {
+                            put("status", "started")
+                            put("session_id", sessionId)
+                        }
+                    }
+                    "chat_with_rag" -> {
+                        val sessionId = arguments.getString("session_id")
+                        val message = arguments.getString("message")
+                        val session = chatSessions.getOrPut(sessionId) { ChatSession() }
+
+                        // Добавляем сообщение пользователя в историю
+                        session.history.add(mapOf("role" to "user", "content" to message))
+
+                        try {
+                            // Формируем поисковый запрос: последние сообщения + память задачи
+                            val searchQuery = buildString {
+                                val recent = session.history.takeLast(4).joinToString(" ") { it["content"] ?: "" }
+                                append(recent)
+                                val taskPrompt = session.taskMemory.toPrompt()
+                                if (taskPrompt.isNotEmpty()) append("\n$taskPrompt")
+                            }
+
+                            // Ищем чанки
+                            val searchResult = searchIndex(searchQuery, "structural", 5)
+                            val resultsArray = searchResult.optJSONArray("results")
+                            val contextBuilder = StringBuilder()
+                            val sources = JSONArray()
+                            if (resultsArray != null) {
+                                for (i in 0 until resultsArray.length()) {
+                                    val item = resultsArray.getJSONObject(i)
+                                    val text = item.optString("text", "")
+                                    val metadata = item.optJSONObject("metadata")
+                                    val section = metadata?.optString("section", "?") ?: "?"
+                                    val chunkId = item.optString("chunk_id", "?")
+                                    val score = item.optDouble("score", 0.0)
+                                    contextBuilder.append("Source [${i + 1}] (section: $section, chunk: $chunkId, score: ${"%.3f".format(score)}):\n$text\n\n")
+                                    sources.put(JSONObject().apply {
+                                        put("section", section)
+                                        put("chunk_id", chunkId)
+                                        put("score", score)
+                                        put("text_preview", text.take(200))
+                                    })
+                                }
+                            }
+
+                            // Формируем промпт
+                            val historyText = session.history.takeLast(6).joinToString("\n") { "${it["role"]}: ${it["content"]}" }
+                            val taskPrompt = session.taskMemory.toPrompt()
+
+                            val prompt = """
+                                Ты — ассистент, использующий базу знаний об отелях Причерноморья.
+                                У тебя есть история диалога и память задачи. Отвечай на сообщение пользователя, опираясь на контекст и историю.
+                                
+                                История диалога (последние сообщения):
+                                $historyText
+                                
+                                $taskPrompt
+                                
+                                Контекст из документов:
+                                $contextBuilder
+                                
+                                Твой ответ **обязательно** должен содержать:
+                                1. Краткий ответ (2-3 предложения).
+                                2. Цитаты из контекста с указанием номера источника в формате [1].
+                                3. Список использованных источников (секция + чанк).
+                                Если контекст не содержит ответа, скажи: "Не знаю. В документах недостаточно информации".
+                                
+                                Сообщение пользователя: $message
+                                Ответ:
+                            """.trimIndent()
+
+                            val llmResponse = callLLM(prompt, apiKey)
+                            val answer = llmResponse.optString("answer", "Ошибка генерации ответа")
+
+                            // Добавляем ответ в историю
+                            session.history.add(mapOf("role" to "assistant", "content" to answer))
+
+                            // Автоматически обновляем память задачи
+                            updateTaskMemory(session, apiKey)
+
+                            JSONObject().apply {
+                                put("answer", answer)
+                                put("sources", sources)
+                                put("session_id", sessionId)
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            JSONObject().apply {
+                                put("answer", "Ошибка при обработке запроса: ${e.message}")
+                                put("sources", JSONArray())
+                                put("session_id", sessionId)
+                            }
+                        }
+                    }
+                    "get_task_state" -> {
+                        val sessionId = arguments.getString("session_id")
+                        val session = chatSessions[sessionId]
+                        if (session == null) {
+                            JSONObject().apply { put("error", "Сессия не найдена") }
+                        } else {
+                            val mem = session.taskMemory
+                            JSONObject().apply {
+                                put("goal", mem.goal)
+                                put("constraints", JSONArray(mem.constraints))
+                                put("terms", JSONArray(mem.terms))
+                                put("notes", JSONArray(mem.notes))
+                            }
+                        }
                     }
                     else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
                 }
@@ -565,4 +752,78 @@ fun callLLM(prompt: String, apiKey: String): JSONObject {
     val json = JSONObject(response.body())
     val answer = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
     return JSONObject().apply { put("answer", answer) }
+}
+
+// ---------- Обновление памяти задачи ----------
+
+fun updateTaskMemory(session: ChatSession, apiKey: String) {
+    val recentHistory = session.history.takeLast(8).joinToString("\n") { "${it["role"]}: ${it["content"]}" }
+    val prompt = """
+        На основе последних сообщений диалога обнови память задачи. Выдели новые ограничения, термины, факты, цель.
+        Текущая память задачи: ${session.taskMemory.toPrompt()}
+        Последние сообщения:
+        $recentHistory
+        
+        Верни JSON с полями:
+        - goal (строка, если изменилась или новая)
+        - constraints (массив строк, новые ограничения)
+        - terms (массив строк, новые термины/факты)
+        - notes (массив строк, дополнительные заметки)
+        Если изменений нет, верни пустой JSON: {}
+        Ответь только JSON, без текста.
+    """.trimIndent()
+
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+    val body = JSONObject().apply {
+        put("model", "deepseek-chat")
+        put("messages", JSONArray().apply {
+            put(JSONObject().apply { put("role", "user"); put("content", prompt) })
+        })
+        put("temperature", 0.0)
+        put("max_tokens", 300)
+    }.toString()
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create("https://api.deepseek.com/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer $apiKey")
+        .timeout(Duration.ofSeconds(30))
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+    try {
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        if (response.statusCode() == 200) {
+            val json = JSONObject(response.body())
+            val content = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content").trim()
+            val cleanJson = content.replace("```json", "").replace("```", "").trim()
+            if (cleanJson.isNotEmpty() && cleanJson.startsWith("{")) {
+                val update = JSONObject(cleanJson)
+                if (update.has("goal") && update.getString("goal").isNotEmpty()) {
+                    session.taskMemory.goal = update.getString("goal")
+                }
+                if (update.has("constraints")) {
+                    val arr = update.getJSONArray("constraints")
+                    for (i in 0 until arr.length()) {
+                        val c = arr.getString(i)
+                        if (c !in session.taskMemory.constraints) session.taskMemory.constraints.add(c)
+                    }
+                }
+                if (update.has("terms")) {
+                    val arr = update.getJSONArray("terms")
+                    for (i in 0 until arr.length()) {
+                        val t = arr.getString(i)
+                        if (t !in session.taskMemory.terms) session.taskMemory.terms.add(t)
+                    }
+                }
+                if (update.has("notes")) {
+                    val arr = update.getJSONArray("notes")
+                    for (i in 0 until arr.length()) {
+                        val n = arr.getString(i)
+                        if (n !in session.taskMemory.notes) session.taskMemory.notes.add(n)
+                    }
+                }
+            }
+        }
+    } catch (e: Exception) {
+        println("Ошибка обновления памяти задачи: ${e.message}")
+    }
 }
