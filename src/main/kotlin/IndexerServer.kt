@@ -65,7 +65,7 @@ fun main() {
         }
     }
     server.start()
-    println("Сервер индексации (чат с RAG + память задачи) запущен на http://localhost:8084/mcp")
+    println("Сервер индексации (чат с RAG + память задачи + Ollama Chat) запущен на http://localhost:8084/mcp")
 }
 
 fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
@@ -217,6 +217,22 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                                 })
                             })
                             put("required", JSONArray().apply { put("session_id") })
+                        })
+                    })
+                    put(JSONObject().apply {
+                        put("name", "ollama_chat")
+                        put("description", "Отправляет запрос в локальную модель через Ollama API")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("message", JSONObject().apply {
+                                    put("type", "string"); put("description", "Сообщение пользователя")
+                                })
+                                put("model", JSONObject().apply {
+                                    put("type", "string"); put("description", "Модель Ollama (по умолчанию deepseek-r1:14b)")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("message") })
                         })
                     })
                 }
@@ -433,6 +449,12 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                                 put("notes", JSONArray(mem.notes))
                             }
                         }
+                    }
+                    "ollama_chat" -> {
+                        val message = arguments.getString("message")
+                        val model = arguments.optString("model", "deepseek-r1:7b")
+                        val response = callOllamaChat(model, message)
+                        JSONObject().apply { put("answer", response) }
                     }
                     else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
                 }
@@ -752,6 +774,29 @@ fun callLLM(prompt: String, apiKey: String): JSONObject {
     val json = JSONObject(response.body())
     val answer = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
     return JSONObject().apply { put("answer", answer) }
+}
+
+// ---------- Ollama Chat ----------
+
+fun callOllamaChat(model: String, prompt: String): String {
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(120)).build()
+    val body = JSONObject().apply {
+        put("model", model)
+        put("prompt", prompt)
+        put("stream", false)
+    }.toString()
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create("http://localhost:11434/api/generate"))
+        .header("Content-Type", "application/json")
+        .timeout(Duration.ofSeconds(120))
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+    val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() != 200) {
+        return "Ошибка Ollama: ${response.statusCode()}"
+    }
+    val json = JSONObject(response.body())
+    return json.optString("response", "Пустой ответ")
 }
 
 // ---------- Обновление памяти задачи ----------

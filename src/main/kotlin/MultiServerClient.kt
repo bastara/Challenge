@@ -180,6 +180,7 @@ fun main() {
     println("  chat <session_id> [goal]   – начать/продолжить RAG-чат с памятью задачи")
     println("  task <session_id>          – показать память задачи")
     println("  stop <session_id>          – завершить сессию чата")
+    println("  compare_models <вопрос>    – сравнить облачный DeepSeek (reasoning) и локальный DeepSeek-R1-7B")
     println("  exit                       – выход")
     println("  help                       – показать список инструментов по серверам")
 
@@ -582,8 +583,64 @@ fun main() {
                 val sessionId = input.removePrefix("stop ").trim()
                 println("Сессия '$sessionId' завершена (память задачи сохранена в памяти сервера до перезапуска).")
             }
+            input.startsWith("compare_models ", true) -> {
+                val question = input.removePrefix("compare_models ").trim()
+                val indexerUrl = "http://localhost:8084/mcp"
+
+                // 1. Облачный ответ (DeepSeek Chat с имитацией reasoning)
+                println("\n=== Облачный DeepSeek (reasoning mode) ===")
+                val askServer = router.getServer("ask_llm")
+                if (askServer != null) {
+                    val rawAsk = callMcpTool(client, askServer.url, "ask_llm",
+                        JSONObject().apply {
+                            put("question", question)
+                        })
+                    try {
+                        val json = JSONObject(rawAsk)
+                        val result = json.getJSONObject("result")
+                        val contentArray = result.getJSONArray("content")
+                        val innerText = contentArray.getJSONObject(0).getString("text")
+                        val innerJson = JSONObject(innerText)
+                        if (innerJson.has("answer")) {
+                            println(innerJson.getString("answer"))
+                        } else {
+                            println("Неожиданный формат ответа: $rawAsk")
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора: ${e.message}")
+                    }
+                } else {
+                    println("❌ Инструмент ask_llm не найден.")
+                }
+
+                // 2. Локальный ответ (Ollama DeepSeek-R1-7B)
+                println("\n=== Локальный DeepSeek-R1-7B (Ollama) ===")
+                val ollamaServer = router.getServer("ollama_chat")
+                if (ollamaServer != null) {
+                    val rawLocal = callMcpTool(client, ollamaServer.url, "ollama_chat",
+                        JSONObject().apply { put("message", question); put("model", "deepseek-r1:7b") })
+                    try {
+                        val json = JSONObject(rawLocal)
+                        val result = json.getJSONObject("result")
+                        val contentArray = result.getJSONArray("content")
+                        val innerText = contentArray.getJSONObject(0).getString("text")
+                        val innerJson = JSONObject(innerText)
+                        if (innerJson.has("answer")) {
+                            println(innerJson.getString("answer"))
+                        } else {
+                            println("Неожиданный формат ответа: $rawLocal")
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора: ${e.message}")
+                    }
+                } else {
+                    println("❌ Инструмент ollama_chat не найден.")
+                }
+
+                println("\n=== Сравнение: облачный DeepSeek (reasoning) vs локальный DeepSeek-R1-7B ===")
+            }
             input.isEmpty() -> continue
-            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both', 'chat', 'task' или 'help'.")
+            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both', 'chat', 'task', 'compare_models' или 'help'.")
         }
     }
 }
