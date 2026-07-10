@@ -65,7 +65,7 @@ fun main() {
         }
     }
     server.start()
-    println("Сервер индексации (чат с RAG + память задачи + Ollama Chat) запущен на http://localhost:8084/mcp")
+    println("Сервер индексации (RAG + локальная LLM) запущен на http://localhost:8084/mcp")
 }
 
 fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
@@ -79,7 +79,7 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                 put("result", JSONObject().apply {
                     put("capabilities", JSONObject())
                     put("serverInfo", JSONObject().apply {
-                        put("name", "chat-rag-server"); put("version", "5.0.0")
+                        put("name", "chat-rag-server"); put("version", "6.0.0")
                     })
                 })
             }
@@ -229,10 +229,32 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                                     put("type", "string"); put("description", "Сообщение пользователя")
                                 })
                                 put("model", JSONObject().apply {
-                                    put("type", "string"); put("description", "Модель Ollama (по умолчанию deepseek-r1:14b)")
+                                    put("type", "string"); put("description", "Модель Ollama (по умолчанию deepseek-r1:7b)")
                                 })
                             })
                             put("required", JSONArray().apply { put("message") })
+                        })
+                    })
+                    put(JSONObject().apply {
+                        put("name", "local_rag_query")
+                        put("description", "Ищет чанки локально и генерирует ответ через локальную LLM (Ollama)")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("question", JSONObject().apply {
+                                    put("type", "string"); put("description", "Вопрос пользователя")
+                                })
+                                put("strategy", JSONObject().apply {
+                                    put("type", "string"); put("description", "fixed или structural (по умолчанию structural)")
+                                })
+                                put("top_k", JSONObject().apply {
+                                    put("type", "integer"); put("description", "Кол-во чанков для контекста (по умолчанию 5)")
+                                })
+                                put("min_score", JSONObject().apply {
+                                    put("type", "number"); put("description", "Порог косинусного сходства")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("question") })
                         })
                     })
                 }
@@ -456,6 +478,65 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                         val response = callOllamaChat(model, message)
                         JSONObject().apply { put("answer", response) }
                     }
+                    "local_rag_query" -> {
+                        val question = arguments.getString("question")
+                        val strategy = arguments.optString("strategy", "structural")
+                        val topK = arguments.optInt("top_k", 5)
+                        val minScore = arguments.optDouble("min_score", 0.0)
+
+                        // 1. Поиск (выполняется локально через Ollama embeddings)
+                        val searchResult = searchIndex(question, strategy, topK)
+                        val resultsArray = searchResult.optJSONArray("results")
+                        val contextBuilder = StringBuilder()
+                        val sources = JSONArray()
+                        var filteredCount = 0
+                        if (resultsArray != null) {
+                            for (i in 0 until resultsArray.length()) {
+                                val item = resultsArray.getJSONObject(i)
+                                val score = item.optDouble("score", 0.0)
+                                if (minScore > 0.0 && score < minScore) continue
+                                filteredCount++
+                                val text = item.optString("text", "")
+                                val metadata = item.optJSONObject("metadata")
+                                val section = metadata?.optString("section", "?") ?: "?"
+                                val chunkId = item.optString("chunk_id", "?")
+                                contextBuilder.append("Source [${filteredCount}] (section: $section, chunk: $chunkId, score: ${"%.3f".format(score)}):\n$text\n\n")
+                                sources.put(JSONObject().apply {
+                                    put("section", section)
+                                    put("chunk_id", chunkId)
+                                    put("score", score)
+                                    put("text_preview", text.take(200))
+                                })
+                            }
+                        }
+
+                        if (filteredCount == 0) {
+                            JSONObject().apply {
+                                put("answer", "Не знаю. Недостаточно релевантного контекста.")
+                                put("sources", JSONArray())
+                            }
+                        } else {
+                            // 2. Генерация локальной моделью
+                            val prompt = """
+                                Ты — ассистент, который использует базу знаний об отелях Причерноморья.
+                                Ответь на вопрос пользователя, опираясь **только** на приведённый ниже контекст.
+                                Твой ответ **обязательно** должен содержать:
+                                1. Краткий ответ (2-3 предложения).
+                                2. Цитаты из контекста с указанием номера источника в формате [1].
+                                3. Список использованных источников в конце (секция + чанк).
+                                Контекст:
+                                $contextBuilder
+                                
+                                Вопрос: $question
+                                Ответ:
+                            """.trimIndent()
+                            val ollamaResponse = callOllamaChat("deepseek-r1:7b", prompt)
+                            JSONObject().apply {
+                                put("answer", ollamaResponse)
+                                put("sources", sources)
+                            }
+                        }
+                    }
                     else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
                 }
 
@@ -552,7 +633,7 @@ fun getEmbedding(text: String): List<Double> {
     val request = HttpRequest.newBuilder()
         .uri(URI.create("http://localhost:11434/api/embeddings"))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(60))
+        .timeout(Duration.ofSeconds(120))
         .POST(HttpRequest.BodyPublishers.ofString(body))
         .build()
     val response = client.send(request, HttpResponse.BodyHandlers.ofString())
@@ -779,7 +860,7 @@ fun callLLM(prompt: String, apiKey: String): JSONObject {
 // ---------- Ollama Chat ----------
 
 fun callOllamaChat(model: String, prompt: String): String {
-    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(120)).build()
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(600)).build()
     val body = JSONObject().apply {
         put("model", model)
         put("prompt", prompt)
@@ -788,7 +869,7 @@ fun callOllamaChat(model: String, prompt: String): String {
     val request = HttpRequest.newBuilder()
         .uri(URI.create("http://localhost:11434/api/generate"))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(120))
+        .timeout(Duration.ofSeconds(600))
         .POST(HttpRequest.BodyPublishers.ofString(body))
         .build()
     val response = client.send(request, HttpResponse.BodyHandlers.ofString())

@@ -17,7 +17,7 @@ class McpRouter(private val servers: List<McpServer>) {
     fun allTools() = toolToServer.keys.toList()
 }
 
-fun callMcpTool(client: HttpClient, serverUrl: String, toolName: String, arguments: JSONObject): String {
+fun callMcpTool(client: HttpClient, serverUrl: String, toolName: String, arguments: JSONObject, timeoutSeconds: Long = 120): String {
     val request = JSONObject().apply {
         put("jsonrpc", "2.0"); put("id", "1"); put("method", "tools/call")
         put("params", JSONObject().apply { put("name", toolName); put("arguments", arguments) })
@@ -25,7 +25,7 @@ fun callMcpTool(client: HttpClient, serverUrl: String, toolName: String, argumen
     val httpRequest = HttpRequest.newBuilder()
         .uri(URI.create(serverUrl))
         .header("Content-Type", "application/json")
-        .timeout(Duration.ofSeconds(120))
+        .timeout(Duration.ofSeconds(timeoutSeconds))
         .POST(HttpRequest.BodyPublishers.ofString(request.toString()))
         .build()
     val response = client.send(httpRequest, HttpResponse.BodyHandlers.ofString())
@@ -181,6 +181,7 @@ fun main() {
     println("  task <session_id>          – показать память задачи")
     println("  stop <session_id>          – завершить сессию чата")
     println("  compare_models <вопрос>    – сравнить облачный DeepSeek (reasoning) и локальный DeepSeek-R1-7B")
+    println("  local_rag <вопрос>         – задать вопрос с локальным RAG (поиск + локальная LLM)")
     println("  exit                       – выход")
     println("  help                       – показать список инструментов по серверам")
 
@@ -592,9 +593,7 @@ fun main() {
                 val askServer = router.getServer("ask_llm")
                 if (askServer != null) {
                     val rawAsk = callMcpTool(client, askServer.url, "ask_llm",
-                        JSONObject().apply {
-                            put("question", question)
-                        })
+                        JSONObject().apply { put("question", question) })
                     try {
                         val json = JSONObject(rawAsk)
                         val result = json.getJSONObject("result")
@@ -639,8 +638,48 @@ fun main() {
 
                 println("\n=== Сравнение: облачный DeepSeek (reasoning) vs локальный DeepSeek-R1-7B ===")
             }
+            input.startsWith("local_rag ", true) -> {
+                val question = input.removePrefix("local_rag ").trim()
+                val server = router.getServer("local_rag_query")
+                if (server == null) {
+                    println("❌ Инструмент local_rag_query не найден.")
+                } else {
+                    println("Локальный RAG обрабатывает запрос...")
+                    val startTime = System.currentTimeMillis()
+
+                    val raw = callMcpTool(client, server.url, "local_rag_query",
+                        JSONObject().apply { put("question", question) },
+                        timeoutSeconds = 600)   // 5 минут для локальной модели
+
+                    val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
+                    try {
+                        val json = JSONObject(raw)
+                        if (json.has("error")) {
+                            println("Ошибка: ${json.opt("error")}")
+                        } else {
+                            val result = json.getJSONObject("result")
+                            val contentArray = result.getJSONArray("content")
+                            val innerText = contentArray.getJSONObject(0).getString("text")
+                            val innerJson = JSONObject(innerText)
+                            val answer = innerJson.optString("answer", "Ошибка генерации")
+                            println("\nОтвет локальной RAG-модели (получен за ${"%.1f".format(elapsed)} с):\n$answer")
+                            val sources = innerJson.optJSONArray("sources")
+                            if (sources != null && sources.length() > 0) {
+                                println("\nИсточники:")
+                                for (i in 0 until sources.length()) {
+                                    val src = sources.getJSONObject(i)
+                                    println("  [${i + 1}] Section: ${src.getString("section")}, Chunk: ${src.getString("chunk_id")}, Score: ${"%.3f".format(src.getDouble("score"))}")
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора ответа: ${e.message}")
+                        println("Сырой ответ: $raw")
+                    }
+                }
+            }
             input.isEmpty() -> continue
-            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both', 'chat', 'task', 'compare_models' или 'help'.")
+            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both', 'chat', 'task', 'compare_models', 'local_rag' или 'help'.")
         }
     }
 }
