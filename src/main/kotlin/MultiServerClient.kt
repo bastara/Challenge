@@ -182,6 +182,7 @@ fun main() {
     println("  stop <session_id>          – завершить сессию чата")
     println("  compare_models <вопрос>    – сравнить облачный DeepSeek (reasoning) и локальный DeepSeek-R1-7B")
     println("  local_rag <вопрос>         – задать вопрос с локальным RAG (поиск + локальная LLM)")
+    println("  compare_optimizations <вопрос> – сравнить стандартную и оптимизированную локальные модели")
     println("  exit                       – выход")
     println("  help                       – показать список инструментов по серверам")
 
@@ -649,7 +650,7 @@ fun main() {
 
                     val raw = callMcpTool(client, server.url, "local_rag_query",
                         JSONObject().apply { put("question", question) },
-                        timeoutSeconds = 600)   // 5 минут для локальной модели
+                        timeoutSeconds = 600)
 
                     val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
                     try {
@@ -678,8 +679,70 @@ fun main() {
                     }
                 }
             }
+            input.startsWith("compare_optimizations ", true) -> {
+                val question = input.removePrefix("compare_optimizations ").trim()
+                val indexerUrl = "http://localhost:8084/mcp"
+
+                // 1. Стандартная модель
+                println("\n=== Стандартная модель (temperature=0.8, без промпта) ===")
+                val ollamaServer = router.getServer("ollama_chat")
+                if (ollamaServer != null) {
+                    val startStd = System.currentTimeMillis()
+                    val rawStd = callMcpTool(client, ollamaServer.url, "ollama_chat",
+                        JSONObject().apply { put("message", question) },
+                        timeoutSeconds = 600)
+                    val elapsedStd = (System.currentTimeMillis() - startStd) / 1000.0
+                    try {
+                        val json = JSONObject(rawStd)
+                        val result = json.getJSONObject("result")
+                        val contentArray = result.getJSONArray("content")
+                        val innerText = contentArray.getJSONObject(0).getString("text")
+                        val innerJson = JSONObject(innerText)
+                        if (innerJson.has("answer")) {
+                            println(innerJson.getString("answer"))
+                            println("(сгенерировано за ${"%.1f".format(elapsedStd)} с)")
+                        } else {
+                            println("Неожиданный формат ответа: $rawStd")
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора: ${e.message}")
+                    }
+                } else {
+                    println("❌ Инструмент ollama_chat не найден.")
+                }
+
+                // 2. Оптимизированная модель
+                println("\n=== Оптимизированная модель (temperature=0.1, max_tokens=300, экспертный промпт) ===")
+                val optimizedServer = router.getServer("optimized_ollama_chat")
+                if (optimizedServer != null) {
+                    val startOpt = System.currentTimeMillis()
+                    val rawOpt = callMcpTool(client, optimizedServer.url, "optimized_ollama_chat",
+                        JSONObject().apply { put("message", question) },
+                        timeoutSeconds = 600)
+                    val elapsedOpt = (System.currentTimeMillis() - startOpt) / 1000.0
+                    try {
+                        val json = JSONObject(rawOpt)
+                        val result = json.getJSONObject("result")
+                        val contentArray = result.getJSONArray("content")
+                        val innerText = contentArray.getJSONObject(0).getString("text")
+                        val innerJson = JSONObject(innerText)
+                        if (innerJson.has("answer")) {
+                            println(innerJson.getString("answer"))
+                            println("(сгенерировано за ${"%.1f".format(elapsedOpt)} с)")
+                        } else {
+                            println("Неожиданный формат ответа: $rawOpt")
+                        }
+                    } catch (e: Exception) {
+                        println("Ошибка разбора: ${e.message}")
+                    }
+                } else {
+                    println("❌ Инструмент optimized_ollama_chat не найден.")
+                }
+
+                println("\n=== Сравнение: стандартная vs оптимизированная модель ===")
+            }
             input.isEmpty() -> continue
-            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both', 'chat', 'task', 'compare_models', 'local_rag' или 'help'.")
+            else -> println("Неизвестная команда. Используйте 'complex', 'index', 'search', 'compare', 'ask', 'rag', 'both', 'chat', 'task', 'compare_models', 'local_rag', 'compare_optimizations' или 'help'.")
         }
     }
 }

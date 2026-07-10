@@ -65,7 +65,7 @@ fun main() {
         }
     }
     server.start()
-    println("Сервер индексации (RAG + локальная LLM) запущен на http://localhost:8084/mcp")
+    println("Сервер индексации (RAG + локальная LLM + оптимизация) запущен на http://localhost:8084/mcp")
 }
 
 fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
@@ -255,6 +255,19 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                                 })
                             })
                             put("required", JSONArray().apply { put("question") })
+                        })
+                    })
+                    put(JSONObject().apply {
+                        put("name", "optimized_ollama_chat")
+                        put("description", "Отправляет запрос в оптимизированную локальную модель через Ollama (temperature=0.1, max_tokens=300, спец. промпт)")
+                        put("parameters", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("message", JSONObject().apply {
+                                    put("type", "string"); put("description", "Сообщение пользователя")
+                                })
+                            })
+                            put("required", JSONArray().apply { put("message") })
                         })
                     })
                 }
@@ -537,6 +550,11 @@ fun handleIndexerRequest(request: JSONObject, apiKey: String): JSONObject {
                             }
                         }
                     }
+                    "optimized_ollama_chat" -> {
+                        val message = arguments.getString("message")
+                        val response = callOllamaChatOptimized(message)
+                        JSONObject().apply { put("answer", response) }
+                    }
                     else -> JSONObject().apply { put("error", "Unknown tool: $toolName") }
                 }
 
@@ -625,7 +643,7 @@ fun chunkStructural(text: String, fileName: String): List<Pair<String, String>> 
 
 fun getEmbedding(text: String): List<Double> {
     val safeText = if (text.length > 800) text.take(800) else text
-    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(60)).build()
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(120)).build()
     val body = JSONObject().apply {
         put("model", "nomic-embed-text")
         put("prompt", safeText)
@@ -875,6 +893,40 @@ fun callOllamaChat(model: String, prompt: String): String {
     val response = client.send(request, HttpResponse.BodyHandlers.ofString())
     if (response.statusCode() != 200) {
         return "Ошибка Ollama: ${response.statusCode()}"
+    }
+    val json = JSONObject(response.body())
+    return json.optString("response", "Пустой ответ")
+}
+
+// ---------- Optimized Ollama Chat ----------
+
+fun callOllamaChatOptimized(prompt: String): String {
+    val optimizedPrompt = """
+        Ты — эксперт по отелям Причерноморья. Используй ТОЛЬКО информацию из контекста.
+        Отвечай кратко (2-3 предложения), обязательно указывай источник.
+        Вопрос: $prompt
+        Ответ (с цитатами):
+    """.trimIndent()
+
+    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(300)).build()
+    val body = JSONObject().apply {
+        put("model", "deepseek-r1:7b")
+        put("prompt", optimizedPrompt)
+        put("stream", false)
+        put("options", JSONObject().apply {
+            put("temperature", 0.1)
+            put("max_tokens", 300)
+        })
+    }.toString()
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create("http://localhost:11434/api/generate"))
+        .header("Content-Type", "application/json")
+        .timeout(Duration.ofSeconds(300))
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+    val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() != 200) {
+        return "Ошибка оптимизированной модели: ${response.statusCode()}"
     }
     val json = JSONObject(response.body())
     return json.optString("response", "Пустой ответ")
