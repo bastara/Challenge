@@ -180,7 +180,7 @@ fun main() {
     println("  chat <session_id> [goal]   – начать/продолжить RAG-чат с памятью задачи")
     println("  task <session_id>          – показать память задачи")
     println("  stop <session_id>          – завершить сессию чата")
-    println("  compare_models <вопрос>    – сравнить облачный DeepSeek (reasoning) и локальный DeepSeek-R1-7B")
+    println("  compare_models <вопрос>    – сравнить облачный DeepSeek (reasoning) и локальный DeepSeek-R1-1.5B")
     println("  local_rag <вопрос>         – задать вопрос с локальным RAG (поиск + локальная LLM)")
     println("  compare_optimizations <вопрос> – сравнить стандартную и оптимизированную локальные модели")
     println("  exit                       – выход")
@@ -613,12 +613,12 @@ fun main() {
                     println("❌ Инструмент ask_llm не найден.")
                 }
 
-                // 2. Локальный ответ (Ollama DeepSeek-R1-7B)
-                println("\n=== Локальный DeepSeek-R1-7B (Ollama) ===")
+                // 2. Локальный ответ (Ollama DeepSeek-R1-1.5B)
+                println("\n=== Локальный DeepSeek-R1-1.5B (Ollama) ===")
                 val ollamaServer = router.getServer("ollama_chat")
                 if (ollamaServer != null) {
                     val rawLocal = callMcpTool(client, ollamaServer.url, "ollama_chat",
-                        JSONObject().apply { put("message", question); put("model", "deepseek-r1:7b") })
+                        JSONObject().apply { put("message", question); put("model", "deepseek-r1:1.5b") })
                     try {
                         val json = JSONObject(rawLocal)
                         val result = json.getJSONObject("result")
@@ -637,7 +637,7 @@ fun main() {
                     println("❌ Инструмент ollama_chat не найден.")
                 }
 
-                println("\n=== Сравнение: облачный DeepSeek (reasoning) vs локальный DeepSeek-R1-7B ===")
+                println("\n=== Сравнение: облачный DeepSeek (reasoning) vs локальный DeepSeek-R1-1.5B ===")
             }
             input.startsWith("local_rag ", true) -> {
                 val question = input.removePrefix("local_rag ").trim()

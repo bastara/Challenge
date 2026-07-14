@@ -11,7 +11,7 @@ import kotlinx.coroutines.*
 
 // Конфигурация
 const val TELEGRAM_API = "https://api.telegram.org"
-const val OLLAMA_API = "http://localhost:11434/api/generate"
+const val OLLAMA_API = "http://81.26.184.66:11434/api/generate"
 var BOT_TOKEN = System.getenv("TELEGRAM_BOT_TOKEN") ?: error("Установите TELEGRAM_BOT_TOKEN")
 var MODEL_NAME = "deepseek-r1:7b"
 
